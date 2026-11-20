@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Oxide Workbench</title>
+<link rel="stylesheet" href="fonts.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app" id="app">
+  <header class="top">
+    <button class="icon-btn rail-toggle" id="railToggle" aria-expanded="false" aria-controls="rail">
+      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg>
+      <span>Lessons</span>
+    </button>
+    <a class="brand" href="#hello" aria-label="Oxide Workbench home">
+      <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true"><path d="M13 1.8 22.7 7.4v11.2L13 24.2 3.3 18.6V7.4z" fill="var(--accent)"/><circle cx="13" cy="13" r="4.6" fill="var(--panel)"/><path d="M13 1.8 22.7 7.4v11.2L13 24.2 3.3 18.6V7.4z" fill="none" stroke="var(--ink)" stroke-opacity="0.25"/></svg>
+      <span class="brand-name">Oxide <span>Workbench</span></span>
+    </a>
+    <div class="progress" id="progress"></div>
+    <button class="icon-btn" id="settingsBtn" aria-haspopup="dialog" title="Settings">
+      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.4" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      <span class="lbl">Settings</span>
+    </button>
+  </header>
+  <div class="view-switch" id="viewSwitch" role="group" aria-label="Show">
+    <button id="vLearn" aria-pressed="true">Lesson</button>
+    <button id="vCode" aria-pressed="false">Code &amp; output</button>
+  </div>
+  <div class="main" id="main" data-view="learn">
+    <nav class="rail" id="rail" aria-label="Course"></nav>
+    <article class="sheet" id="sheet" aria-live="polite"></article>
+    <section class="bench" aria-label="Workbench">
+      <div class="ed-bar">
+        <div class="ed-tab"><i id="dirtyDot"></i><span>src/main.rs</span></div>
+        <div class="ed-actions">
+          <label class="engine" title="How your code runs"><span class="lbl">Engine</span><select id="engineSel" aria-label="Engine"></select></label>
+          <button class="ed-btn" id="resetBtn" title="Restore the starter code"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8a5 5 0 1 0 1.6-3.7M3 2.5V5h2.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg><span class="lbl">Reset</span></button>
+          <a class="ed-btn" id="playLink" href="https://play.rust-lang.org/" target="_blank" rel="noopener" title="Open this code in the official Rust Playground (real compiler)"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M9 3h4v4M13 3 7.5 8.5M12 9.5V13H3V4h3.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="lbl">Playground</span></a>
+          <button class="run-btn" id="runBtn"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 1.5v9l8-4.5z" fill="currentColor"/></svg><span id="runLabel">Run</span><kbd>Ctrl ↵</kbd></button>
+        </div>
+      </div>
+      <div class="editor" id="editor">
+        <div class="gutter" id="gutter" aria-hidden="true"></div>
+        <div class="code-wrap">
+          <pre id="hl" aria-hidden="true"></pre>
+          <textarea id="code" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off" aria-label="Rust code editor"></textarea>
+        </div>
+      </div>
+      <div class="out-tabs" role="tablist" aria-label="Output panels">
+        <button class="out-tab" role="tab" id="tabOut" aria-selected="true" aria-controls="paneOut">Output</button>
+        <button class="out-tab" role="tab" id="tabIn" aria-selected="false" aria-controls="paneIn">Input <span class="badge" id="stdinBadge" hidden>stdin</span></button>
+        <button class="out-tab" role="tab" id="tabTutor" aria-selected="false" aria-controls="paneTutor" hidden>Tutor</button>
+        <div class="status" id="status"><span class="pill idle">ready</span></div>
+      </div>
+      <div class="pane" id="paneOut" role="tabpanel" aria-labelledby="tabOut"></div>
+      <div class="pane" id="paneIn" role="tabpanel" aria-labelledby="tabIn" hidden>
+        <div class="stdin-pane">
+          <p>Text your program reads from standard input, one line per <code>read_line</code> or <code>lines()</code> item.</p>
+          <textarea id="stdin" spellcheck="false" aria-label="Program input"></textarea>
+        </div>
+      </div>
+      <div class="pane" id="paneTutor" role="tabpanel" aria-labelledby="tabTutor" hidden>
+        <div class="tutor">
+          <div class="tutor-log" id="tutorLog"></div>
+          <form class="tutor-form" id="tutorForm">
+            <textarea id="tutorInput" rows="1" placeholder="Ask about this lesson or your code" aria-label="Question for the tutor"></textarea>
+            <button class="run-btn" id="tutorSend" type="submit">Ask</button>
+          </form>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+<dialog class="settings" id="settings" aria-labelledby="settingsTitle">
+  <form method="dialog" class="settings-inner">
+    <header class="settings-head">
+      <h2 id="settingsTitle">Settings</h2>
+      <button class="icon-btn" value="close" aria-label="Close settings">Close</button>
+    </header>
+    <section>
+      <h3>Run engine</h3>
+      <p id="toolchainInfo">Checking for a Rust toolchain…</p>
+    </section>
+    <section>
+      <h3>Tutor</h3>
+      <p>The tutor sends your question, the current lesson, your code and the last output to Claude. It needs an Anthropic API key, and you pay for what you use on that key. The key is stored only on this computer, in the app's settings folder.</p>
+      <p id="keyStatus"></p>
+      <div class="key-row">
+        <input type="password" id="apiKeyInput" placeholder="sk-ant-..." autocomplete="off" spellcheck="false" aria-label="Anthropic API key">
+        <button class="btn primary" type="button" id="saveKeyBtn">Save key</button>
+        <button class="btn" type="button" id="clearKeyBtn">Remove key</button>
+      </div>
+      <p class="fine">Create a key in the Anthropic Console under API keys. If the <code>ANTHROPIC_API_KEY</code> environment variable is set when the app starts, it is used when no key is saved here.</p>
+    </section>
+  </form>
+</dialog>
+<script src="rustlite.js"></script>
+<script src="lessons.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

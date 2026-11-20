@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Oxide Workbench",
+  "version": "0.1.0",
+  "identifier": "dev.oxideworkbench.app",
+  "build": {
+    "frontendDist": "../ui",
+    "beforeBuildCommand": "node engine/build.mjs",
+    "beforeDevCommand": "node engine/build.mjs"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Oxide Workbench",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 900,
+        "minHeight": 600,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Education",
+    "shortDescription": "Learn Rust with lessons, an editor and a real compiler",
+    "longDescription": "Oxide Workbench teaches Rust step by step: ownership, borrowing, traits, iterators, concurrency and performance, ending with a key-value store and a request router. Code runs with the Rust toolchain on your computer, or with a built-in teaching interpreter when Rust is not installed.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

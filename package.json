@@ -1,0 +1,17 @@
+{
+  "name": "oxide-workbench",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Learn Rust by writing it: lessons, an editor and a real compiler in one desktop app",
+  "scripts": {
+    "build:engine": "node engine/build.mjs",
+    "test:engine": "node engine/build.mjs && node tests/harness.js",
+    "test:backend": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}

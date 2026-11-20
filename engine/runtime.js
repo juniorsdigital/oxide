@@ -1,0 +1,3138 @@
+// ---------- RustLite: interpreter ----------
+class Panic { constructor(msg, pos) { this.msg = msg; this.pos = pos; } }
+class ExitSig { constructor(code) { this.code = code; } }
+class BreakSig { constructor(label, val) { this.label = label; this.val = val; } }
+class ContinueSig { constructor(label) { this.label = label; } }
+class ReturnSig { constructor(val) { this.val = val; } }
+const DONE = undefined;
+
+class Env {
+  constructor(parent) { this.parent = parent; this.vars = new Map(); if (parent) { this.selfType = parent.selfType; this.fnDecl = parent.fnDecl; } }
+  lookup(name) { let e = this; while (e) { const c = e.vars.get(name); if (c) return c; e = e.parent; } return null; }
+}
+class It {
+  constructor(nx, info) { this.k = 'iter'; this.nx = nx; this.peeked = DONE; this.hasPeek = false; this.info = info || 'Iter'; }
+  next() { if (this.hasPeek) { this.hasPeek = false; return this.peeked; } return this.nx(); }
+  peek() { if (!this.hasPeek) { this.peeked = this.nx(); this.hasPeek = true; } return this.peeked; }
+}
+function itFromArray(arr, info) { let i = 0; return new It(() => (i < arr.length ? arr[i++] : DONE), info); }
+
+const MUT_METHODS = {
+  vec: new Set(['push', 'pop', 'insert', 'remove', 'swap_remove', 'clear', 'truncate', 'sort', 'sort_unstable', 'sort_by', 'sort_by_key', 'sort_unstable_by', 'sort_unstable_by_key', 'reverse', 'dedup', 'dedup_by_key', 'retain', 'extend', 'extend_from_slice', 'append', 'drain', 'split_off', 'resize', 'fill', 'swap', 'iter_mut', 'get_mut', 'first_mut', 'last_mut', 'push_back', 'push_front', 'pop_back', 'pop_front', 'front_mut', 'back_mut', 'rotate_left', 'rotate_right', 'as_mut_slice']),
+  String: new Set(['push', 'push_str', 'pop', 'insert', 'insert_str', 'remove', 'clear', 'truncate', 'retain', 'extend', 'drain']),
+  map: new Set(['insert', 'remove', 'entry', 'get_mut', 'clear', 'values_mut', 'iter_mut', 'retain', 'extend', 'remove_entry']),
+  set: new Set(['insert', 'remove', 'clear', 'retain', 'extend', 'take']),
+  enum: new Set(['take', 'replace', 'as_mut', 'get_or_insert_with', 'get_or_insert', 'insert']),
+  iter: new Set(['next', 'peek', 'next_back', 'nth', 'by_ref']),
+  stdin: new Set([]),
+};
+const CONSUME_METHODS = {
+  enum: new Set(['unwrap', 'expect', 'unwrap_or', 'unwrap_or_else', 'unwrap_or_default', 'map', 'and_then', 'ok_or', 'ok_or_else', 'ok', 'err', 'unwrap_err', 'expect_err', 'map_err', 'or', 'or_else', 'filter', 'flatten', 'zip', 'map_or', 'map_or_else', 'into_iter']),
+  vec: new Set(['into_iter', 'into_boxed_slice']),
+  String: new Set(['into_bytes', 'into_boxed_str']),
+  map: new Set(['into_iter', 'into_keys', 'into_values']),
+  set: new Set(['into_iter']),
+};
+const REF_RETURNING = new Set(['iter', 'iter_mut', 'first', 'last', 'get', 'get_mut', 'as_str', 'as_slice', 'chars', 'char_indices', 'bytes', 'split_whitespace', 'split', 'lines', 'keys', 'values', 'values_mut', 'trim', 'trim_start', 'trim_end', 'as_ref', 'as_mut', 'last_mut', 'first_mut', 'peek', 'as_bytes', 'windows', 'chunks', 'front', 'back', 'as_deref', 'entry']);
+const REF_RETURNING_MUT = new Set(['iter_mut', 'get_mut', 'values_mut', 'as_mut', 'last_mut', 'first_mut', 'entry']);
+const LAZY_ADAPTORS = new Set(['map', 'filter', 'enumerate', 'rev', 'zip', 'skip', 'take', 'peekable', 'chain', 'cloned', 'copied', 'filter_map', 'take_while', 'skip_while', 'step_by', 'flat_map', 'inspect']);
+const PRIM_TYPES = new Set(Object.keys(INT_BITS).concat(['f32', 'f64', 'bool', 'char', 'str', 'String']));
+const SIZE_OF = { i8: 1, u8: 1, i16: 2, u16: 2, i32: 4, u32: 4, f32: 4, char: 4, bool: 1, i64: 8, u64: 8, f64: 8, isize: 8, usize: 8, i128: 16, u128: 16, String: 24, Vec: 24, Box: 8 };
+
+function createRuntime(items, G, src, opts) {
+  const out = opts.out; // array of {s, t}
+  const stdinLines = (opts.stdin || '').split('\n'); let stdinPos = 0;
+  const timeLimit = opts.timeLimit || 4000;
+  const t0 = Date.now(); let steps = 0; let outLen = 0;
+  const structs = G.structs, enums = G.enums, traits = G.traits;
+  const typeAliases = new Map();
+  const impls = new Map(); // typeKey -> {inherent: Map, traitImpls: [{trait, arg, methods: Map}], consts: Map}
+  const constCells = new Map();
+  let depth = 0;
+  const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+  // ---- errors ----
+  const span = (n, text, primary) => ({ pos: n.pos, end: Math.max(n.end || n.pos + 1, n.pos + 1), text: text || '', primary: primary !== false });
+  const cerr = (code, msg, labels, notes) => new CompileError(code, msg, labels, notes);
+  const srcOf = (n) => src.slice(n.pos, n.end);
+  const panic = (msg, n) => { throw new Panic(msg, n ? n.pos : 0); };
+
+  // ---- registration ----
+  function implEntry(key) {
+    let e = impls.get(key);
+    if (!e) { e = { inherent: new Map(), traitImpls: [], consts: new Map() }; impls.set(key, e); }
+    return e;
+  }
+  function tyKey(ty) {
+    if (!ty) return '?';
+    if (ty.tk === 'ref') return tyKey(ty.inner);
+    if (ty.tk === 'slice' || ty.tk === 'array') return 'Vec';
+    if (ty.tk === 'tuple') return 'tuple';
+    if (ty.tk === 'path') { const a = typeAliases.get(ty.name); return a ? tyKey(a) : ty.name; }
+    return ty.name || '?';
+  }
+  function register(items) {
+    for (const it of items) {
+      if (it.k === 'typealias') typeAliases.set(it.name, it.ty);
+      if (it.k === 'mod') register(it.items);
+      if (it.k === 'fn' && it.body) registerNested(it.body);
+    }
+    for (const it of items) {
+      if (it.k !== 'impl') continue;
+      const key = tyKey(it.ty);
+      const e = implEntry(key);
+      const fnItems = it.items.filter((x) => x.k === 'fn');
+      for (const f of it.items) if (f.k === 'const') e.consts.set(f.name, f);
+      for (const f of fnItems) { f.implTy = key; f.implGenerics = it.generics; if (f.body) registerNested(f.body); }
+      if (!it.trait) { for (const f of fnItems) e.inherent.set(f.name, f); continue; }
+      const traitName = it.trait.name;
+      const methods = new Map();
+      for (const f of fnItems) methods.set(f.name, f);
+      const tdef = traits.get(traitName);
+      if (tdef) {
+        for (const tf of tdef.items) {
+          if (tf.k === 'fn' && tf.body && !methods.has(tf.name)) { const copy = Object.assign({}, tf, { implTy: key, fromTrait: traitName }); methods.set(tf.name, copy); }
+          if (tf.k === 'const' && tf.expr && !e.consts.has(tf.name)) e.consts.set(tf.name, tf);
+        }
+        for (const tf of tdef.items) {
+          if (tf.k === 'fn' && !tf.body && !methods.has(tf.name)) {
+            throw cerr('E0046', 'not all trait items implemented, missing: `' + tf.name + '`', [{ pos: it.pos, end: it.pos + 4, text: 'missing `' + tf.name + '` in implementation', primary: true }]);
+          }
+        }
+      }
+      e.traitImpls.push({ trait: traitName, arg: it.trait.args && it.trait.args[0] ? tyKey(it.trait.args[0]) : null, methods });
+    }
+  }
+  function registerNested(block) {
+    const nested = block.stmts.filter((s) => s.k === 'item').map((s) => s.item);
+    if (nested.length) register(nested);
+  }
+  register(items);
+
+  function findMethod(key, name) {
+    const e = impls.get(key);
+    if (!e) return null;
+    const f = e.inherent.get(name);
+    if (f) return f;
+    for (const ti of e.traitImpls) { const m = ti.methods.get(name); if (m) return m; }
+    return null;
+  }
+  function findTraitMethod(key, trait, name) {
+    const e = impls.get(key);
+    if (!e) return null;
+    for (const ti of e.traitImpls) if (ti.trait === trait) { const m = ti.methods.get(name); if (m) return m; }
+    return null;
+  }
+  function hasTrait(key, trait) { const e = impls.get(key); return !!(e && e.traitImpls.some((t) => t.trait === trait)); }
+  function derives(v, d) {
+    if (v.k === 'struct') { const def = structs.get(v.name); return !!(def && def.derives.has(d)); }
+    if (v.k === 'enum') {
+      if (v.en === 'Option' || v.en === 'Result' || v.en === 'Ordering') return true;
+      const def = enums.get(v.en); return !!(def && def.derives.has(d));
+    }
+    return true;
+  }
+
+  // ---- type helpers ----
+  function typeKey(v) {
+    switch (v.k) {
+      case 'int': return v.ty || 'i32';
+      case 'float': return v.ty || 'f64';
+      case 'bool': return 'bool';
+      case 'char': return 'char';
+      case 'str': return 'str';
+      case 'String': return 'String';
+      case 'vec': return v.kind === 'VecDeque' ? 'VecDeque' : 'Vec';
+      case 'tuple': return 'tuple';
+      case 'struct': return v.name;
+      case 'enum': return v.en;
+      case 'map': return v.kind;
+      case 'set': return v.kind;
+      case 'stderr': return v.name;
+      default: return v.k;
+    }
+  }
+  function typeName(v, depthLimit) {
+    if (!v) return '?';
+    depthLimit = depthLimit === undefined ? 3 : depthLimit;
+    if (depthLimit < 0) return '_';
+    const inner = (x) => typeName(x, depthLimit - 1);
+    switch (v.k) {
+      case 'int': return v.ty || '{integer}';
+      case 'float': return v.ty || '{float}';
+      case 'str': return '&str';
+      case 'ref': return (v.mut ? '&mut ' : '&') + inner(v.place.get());
+      case 'vec': {
+        const el = v.items.length ? inner(v.items[0]) : '_';
+        if (v.kind === 'array') return '[' + el + '; ' + v.items.length + ']';
+        if (v.kind === 'slice') return '[' + el + ']';
+        return (v.kind === 'VecDeque' ? 'VecDeque<' : 'Vec<') + el + '>';
+      }
+      case 'tuple': return '(' + v.items.map(inner).join(', ') + (v.items.length === 1 ? ',)' : ')');
+      case 'struct': return v.name;
+      case 'enum':
+        if (v.en === 'Option') return 'Option<' + (v.vals.length ? inner(v.vals[0]) : '_') + '>';
+        if (v.en === 'Result') return 'Result<' + (v.variant === 'Ok' ? inner(v.vals[0]) + ', _' : '_, ' + inner(v.vals[0])) + '>';
+        return v.en;
+      case 'map': { const f = v.m.values().next().value; return v.kind + '<' + (f ? inner(f.k) + ', ' + inner(f.v) : '_, _') + '>'; }
+      case 'set': { const f = v.m.values().next().value; return v.kind + '<' + (f ? inner(f) : '_') + '>'; }
+      case 'closure': return 'closure';
+      case 'fn': return 'fn item';
+      case 'rc': return v.kind + '<' + inner(v.cell.val) + '>';
+      case 'cell': return v.kind + '<' + inner(v.place.val) + '>';
+      case 'iter': return 'impl Iterator';
+      case 'range': return 'Range<' + (v.lo ? inner(v.lo) : v.hi ? inner(v.hi) : '_') + '>';
+      case 'stderr': return v.name;
+      case 'duration': return 'Duration';
+      case 'instant': return 'Instant';
+      default: return v.k;
+    }
+  }
+  function tyText(ty) {
+    if (!ty) return '()';
+    switch (ty.tk) {
+      case 'ref': return (ty.mut ? '&mut ' : '&') + tyText(ty.inner);
+      case 'path': return ty.name + (ty.args && ty.args.length ? '<' + ty.args.map(tyText).join(', ') + '>' : '');
+      case 'tuple': return '(' + ty.elems.map(tyText).join(', ') + ')';
+      case 'slice': return '[' + tyText(ty.elem) + ']';
+      case 'array': return '[' + tyText(ty.elem) + '; N]';
+      default: return ty.name || ty.tk;
+    }
+  }
+  function resolveTy(ty) {
+    if (ty && ty.tk === 'path' && typeAliases.has(ty.name)) return resolveTy(typeAliases.get(ty.name));
+    return ty;
+  }
+  function isCopy(v) {
+    switch (v.k) {
+      case 'int': case 'float': case 'bool': case 'char': case 'str': case 'fn': case 'bfn': case 'range': case 'duration': case 'instant': case 'closure': case 'ref': return true;
+      case 'tuple': return v.items.every(isCopy);
+      case 'vec': return v.kind === 'array' && v.items.every(isCopy);
+      case 'struct': { const d = structs.get(v.name); return !!(d && d.derives.has('Copy')); }
+      case 'enum': {
+        if (v.en === 'Option' || v.en === 'Result') return v.vals.every(isCopy);
+        if (v.en === 'Ordering') return true;
+        const d = enums.get(v.en); return !!(d && d.derives.has('Copy'));
+      }
+      default: return false;
+    }
+  }
+  function copyVal(v) {
+    switch (v.k) {
+      case 'tuple': return v.items.length ? { k: 'tuple', items: v.items.map(copyVal) } : v;
+      case 'vec': return mkVec(v.items.map(copyVal), v.kind);
+      case 'struct': { const f = {}; for (const k in v.fields) f[k] = copyVal(v.fields[k]); return { k: 'struct', name: v.name, fields: f }; }
+      case 'enum': return v.fields ? Object.assign({}, v, { fields: Object.fromEntries(Object.entries(v.fields).map(([a, b]) => [a, copyVal(b)])) }) : Object.assign({}, v, { vals: v.vals.map(copyVal) });
+      default: return v;
+    }
+  }
+  function cloneVal(v, n) {
+    switch (v.k) {
+      case 'String': return mkString(v.v);
+      case 'vec': return mkVec(v.items.map((x) => cloneVal(x, n)), v.kind === 'slice' ? 'Vec' : v.kind);
+      case 'tuple': return v.items.length ? { k: 'tuple', items: v.items.map((x) => cloneVal(x, n)) } : v;
+      case 'struct': {
+        const f = {}; for (const k in v.fields) f[k] = cloneVal(v.fields[k], n);
+        return { k: 'struct', name: v.name, fields: f };
+      }
+      case 'enum': return v.fields ? Object.assign({}, v, { fields: Object.fromEntries(Object.entries(v.fields).map(([a, b]) => [a, cloneVal(b, n)])) }) : Object.assign({}, v, { vals: v.vals.map((x) => cloneVal(x, n)) });
+      case 'map': { const m = new Map(); for (const [ks, e] of v.m) m.set(ks, { k: cloneVal(e.k, n), v: cloneVal(e.v, n) }); return { k: 'map', kind: v.kind, m }; }
+      case 'set': { const m = new Map(); for (const [ks, e] of v.m) m.set(ks, cloneVal(e, n)); return { k: 'set', kind: v.kind, m }; }
+      case 'rc': v.cell.strong++; return { k: 'rc', kind: v.kind, cell: v.cell };
+      case 'cell': return { k: 'cell', kind: v.kind, place: { val: cloneVal(v.place.val, n) } };
+      case 'sender': return { k: 'sender', ch: v.ch };
+      default: return v;
+    }
+  }
+  function deref(v) { while (v && (v.k === 'ref' || v.k === 'rc')) v = v.k === 'ref' ? v.place.get() : v.cell.val; return v; }
+  function derefRefs(v) { while (v && v.k === 'ref') v = v.place.get(); return v; }
+
+  // ---- variables & borrows ----
+  function declSpan(cell) { return cell.decl ? { pos: cell.decl.pos, end: cell.decl.end } : null; }
+  function movedError(cell, n, mode) {
+    const name = cell.name;
+    const isBorrow = mode === 'borrow' || mode === 'mutborrow' || mode === 'read';
+    const labels = [];
+    const ds = declSpan(cell);
+    const tyN = cell.movedType || 'T';
+    if (ds) labels.push({ pos: ds.pos, end: ds.end, text: 'move occurs because `' + name + '` has type `' + tyN + '`, which does not implement the `Copy` trait', primary: false });
+    if (cell.moved && cell.moved.pos !== undefined) {
+      const later = cell.moved.pos > n.pos;
+      labels.push({ pos: cell.moved.pos, end: cell.moved.end || cell.moved.pos + 1, text: cell.moved.text || (later ? 'value moved here, in previous iteration of loop' : 'value moved here'), primary: false });
+    }
+    labels.push(span(n, isBorrow ? 'value borrowed here after move' : 'value used here after move'));
+    const notes = [];
+    if (cell.moved && cell.moved.hint) notes.push(cell.moved.hint);
+    else if (tyN === 'String' || tyN.startsWith('Vec') || /^[A-Z]/.test(tyN)) notes.push('help: consider cloning the value if the performance cost is acceptable: `.clone()`');
+    return cerr('E0382', (isBorrow ? 'borrow of moved value: `' : 'use of moved value: `') + name + '`', labels, notes);
+  }
+  function checkBorrows(cell, n, kind) {
+    const bs = cell.borrows;
+    if (!bs || !bs.length) return;
+    const pos = n.pos;
+    for (const b of bs) {
+      if (b.dead || pos <= b.created || pos > b.until) continue;
+      if (b.kind === 'shared' && (kind === 'read' || kind === 'borrow')) continue;
+      const name = cell.name;
+      const later = b.usePos ? [{ pos: b.usePos, end: b.useEnd, text: (b.kind === 'mut' && kind === 'mutborrow' ? 'first borrow' : b.kind === 'mut' ? 'mutable borrow' : 'immutable borrow') + ' later used here', primary: false }] : [];
+      const bspan = { pos: b.pos, end: b.end, primary: false };
+      if (kind === 'write') {
+        throw cerr('E0506', 'cannot assign to `' + srcOf(n) + '` because it is borrowed', [Object.assign(bspan, { text: '`' + name + '` is borrowed here' }), span(n, '`' + srcOf(n) + '` is assigned to here but it was already borrowed')].concat(later.map((l) => Object.assign(l, { text: 'borrow later used here' }))));
+      }
+      if (kind === 'move') {
+        throw cerr('E0505', 'cannot move out of `' + name + '` because it is borrowed', [Object.assign(bspan, { text: 'borrow of `' + name + '` occurs here' }), span(n, 'move out of `' + name + '` occurs here')].concat(later.map((l) => Object.assign(l, { text: 'borrow later used here' }))));
+      }
+      if (b.kind === 'mut' && kind === 'mutborrow') {
+        throw cerr('E0499', 'cannot borrow `' + name + '` as mutable more than once at a time', [Object.assign(bspan, { text: 'first mutable borrow occurs here' }), span(n, 'second mutable borrow occurs here')].concat(later));
+      }
+      if (b.kind === 'mut') {
+        if (kind === 'read') throw cerr('E0503', 'cannot use `' + name + '` because it was mutably borrowed', [Object.assign(bspan, { text: '`' + name + '` is borrowed here' }), span(n, 'use of borrowed `' + name + '`')].concat(later.map((l) => Object.assign(l, { text: 'borrow later used here' }))));
+        throw cerr('E0502', 'cannot borrow `' + name + '` as immutable because it is also borrowed as mutable', [Object.assign(bspan, { text: 'mutable borrow occurs here' }), span(n, 'immutable borrow occurs here')].concat(later));
+      }
+      throw cerr('E0502', 'cannot borrow `' + name + '` as mutable because it is also borrowed as immutable', [Object.assign(bspan, { text: 'immutable borrow occurs here' }), span(n, 'mutable borrow occurs here')].concat(later));
+    }
+  }
+  function readVar(cell, n, mode) {
+    if (!cell.init) {
+      throw cerr('E0381', 'used binding `' + cell.name + '` isn\'t initialized', [cell.decl ? { pos: cell.decl.pos, end: cell.decl.end, text: 'binding declared here but left uninitialized', primary: false } : null, span(n, '`' + cell.name + '` used here but it isn\'t initialized')].filter(Boolean));
+    }
+    if (cell.moved) throw movedError(cell, n, mode);
+    if (mode !== 'peek') checkBorrows(cell, n, mode === 'move' ? 'move' : mode);
+    return cell.val;
+  }
+  function markMoved(cell, n, text, hint) {
+    if (isCopy(cell.val)) return;
+    cell.moved = { pos: n.pos, end: n.end, text, hint };
+    cell.movedType = typeName(cell.val);
+  }
+  function lookupVar(n, env) {
+    if (n.k !== 'path' || n.segs.length !== 1) return null;
+    return env.lookup(n.segs[0]);
+  }
+
+  // ---- places ----
+  function isPlaceExpr(n) {
+    return (n.k === 'path' && n.segs.length === 1) || n.k === 'field' || n.k === 'index' || (n.k === 'unary' && n.op === '*') || (n.k === 'paren' && isPlaceExpr(n.e));
+  }
+  function evPlace(n, env, mode) {
+    switch (n.k) {
+      case 'paren': return evPlace(n.e, env, mode);
+      case 'path': {
+        const cell = env.lookup(n.segs[0]);
+        if (!cell) { const v = evPath(n, env, null, mode); const p = tempPlace(v); return p; }
+        readVar(cell, n, mode);
+        return { get: () => cell.val, set: (v) => { cell.val = v; }, mutable: cell.mut, viaRef: 'none', root: cell, cell, name: cell.name };
+      }
+      case 'unary': {
+        const v = ev(n.e, env);
+        if (v.k === 'ref') return { get: v.place.get, set: v.place.set, mutable: v.mut, viaRef: v.mut ? 'mut' : 'shared', root: rootCellOf(n.e, env), refName: srcOf(n.e), name: srcOf(n) };
+        if (v.k === 'rc') return { get: () => v.cell.val, set: (x) => { v.cell.val = x; }, mutable: false, viaRef: 'shared', root: null, refName: srcOf(n.e), name: srcOf(n), rc: true };
+        if (v.k === 'cell') return { get: () => v.place.val, set: (x) => { v.place.val = x; }, mutable: true, viaRef: 'mut', root: null };
+        throw cerr('E0614', 'type `' + typeName(v) + '` cannot be dereferenced', [span(n, 'can\'t be dereferenced')]);
+      }
+      case 'field': {
+        const base = isPlaceExpr(n.e) ? evPlace(n.e, env, mode) : tempPlace(ev(n.e, env));
+        let v = base.get(); let mutable = base.mutable; let viaRef = base.viaRef; let refName = base.refName || base.name;
+        let rcVia = false;
+        while (v.k === 'ref' || v.k === 'rc') {
+          if (v.k === 'ref') { mutable = v.mut; viaRef = v.mut ? 'mut' : 'shared'; refName = srcOf(n.e); v = v.place.get(); }
+          else { mutable = false; viaRef = 'shared'; rcVia = true; refName = srcOf(n.e); v = v.cell.val; }
+        }
+        const obj = v;
+        if (obj.k === 'struct' || (obj.k === 'enum' && obj.fields)) {
+          if (!(n.name in obj.fields)) {
+            const def = structs.get(obj.name);
+            const avail = def ? def.fields.map((f) => '`' + f.name + '`').join(', ') : '';
+            throw cerr('E0609', 'no field `' + n.name + '` on type `' + obj.name + '`', [{ pos: n.namePos, end: n.end, text: 'unknown field', primary: true }], avail ? ['note: available fields are: ' + avail] : []);
+          }
+          if (base.cell && base.cell.partial && base.cell.partial[n.name]) {
+            const pm = base.cell.partial[n.name];
+            throw cerr('E0382', 'use of moved value: `' + srcOf(n) + '`', [{ pos: pm.pos, end: pm.end, text: 'value moved here', primary: false }, span(n, 'value used here after move')]);
+          }
+          return { get: () => obj.fields[n.name], set: (x) => { obj.fields[n.name] = x; }, mutable, viaRef, root: base.root, refName, name: srcOf(n), fieldOf: base.cell, field: n.name, rcVia };
+        }
+        if (obj.k === 'tuple' && /^\d+$/.test(n.name)) {
+          const i = +n.name;
+          if (i >= obj.items.length) throw cerr('E0609', 'no field `' + n.name + '` on type `' + typeName(obj) + '`', [{ pos: n.namePos, end: n.end, text: 'unknown field', primary: true }]);
+          return { get: () => obj.items[i], set: (x) => { obj.items[i] = x; }, mutable, viaRef, root: base.root, refName, name: srcOf(n), rcVia };
+        }
+        if (obj.k === 'enum' && !obj.fields && /^\d+$/.test(n.name)) {
+          throw cerr('E0609', 'no field `' + n.name + '` on type `' + typeName(obj) + '`', [{ pos: n.namePos, end: n.end, text: 'unknown field', primary: true }], obj.en === 'Option' ? ['help: use `match`, `if let`, or `.unwrap()` to get the value inside the `Option`'] : []);
+        }
+        throw cerr('E0609', 'no field `' + n.name + '` on type `' + typeName(obj) + '`', [{ pos: n.namePos, end: n.end, text: 'unknown field', primary: true }]);
+      }
+      case 'index': {
+        const base = isPlaceExpr(n.e) ? evPlace(n.e, env, mode) : tempPlace(ev(n.e, env));
+        let v = base.get(); let mutable = base.mutable; let viaRef = base.viaRef; let refName = base.refName || base.name;
+        while (v.k === 'ref' || v.k === 'rc') {
+          if (v.k === 'ref') { mutable = v.mut; viaRef = v.mut ? 'mut' : 'shared'; refName = srcOf(n.e); v = v.place.get(); }
+          else { mutable = false; viaRef = 'shared'; v = v.cell.val; }
+        }
+        const idx = deref(ev(n.idx, env));
+        const obj = v;
+        if (obj.k === 'vec') {
+          if (idx.k === 'range') {
+            const [a, b] = rangeBounds(idx, obj.items.length, n);
+            const sl = mkVec(obj.items.slice(a, b), 'slice');
+            sl.parent = obj; sl.offset = a;
+            return { get: () => sl, set: () => {}, mutable, viaRef, root: base.root, refName, name: srcOf(n), isSlice: true };
+          }
+          if (idx.k !== 'int') throw cerr('E0277', 'the type `[' + (obj.items[0] ? typeName(obj.items[0]) : 'T') + ']` cannot be indexed by `' + typeName(idx) + '`', [span(n.idx, 'slice indices are of type `usize` or ranges of `usize`')]);
+          if (idx.ty && idx.ty !== 'usize') throw cerr('E0277', 'the type `[' + (obj.items[0] ? typeName(obj.items[0]) : 'T') + ']` cannot be indexed by `' + idx.ty + '`', [span(n.idx, 'slice indices are of type `usize` or ranges of `usize`')], ['help: convert the index with `as usize`, for example `v[i as usize]`']);
+          const i = Number(idx.v);
+          if (i < 0 || i >= obj.items.length) panic('index out of bounds: the len is ' + obj.items.length + ' but the index is ' + idx.v, n);
+          return { get: () => obj.items[i], set: (x) => { obj.items[i] = x; if (obj.parent) obj.parent.items[obj.offset + i] = x; }, mutable, viaRef, root: base.root, refName, name: srcOf(n) };
+        }
+        if (obj.k === 'String' || obj.k === 'str') {
+          if (idx.k === 'range') {
+            const s = obj.v; const blen = utf8Len(s);
+            const [a, b] = rangeBounds(idx, blen, n, 'byte');
+            const ia = byteToIdx(s, a), ib = byteToIdx(s, b);
+            if (ia < 0 || ib < 0) panic('byte index ' + (ia < 0 ? a : b) + ' is not a char boundary', n);
+            const r = mkStr(s.slice(ia, ib));
+            return { get: () => r, set: () => {}, mutable: false, viaRef, root: base.root, name: srcOf(n), isSlice: true };
+          }
+          throw cerr('E0277', 'the type `str` cannot be indexed by `' + typeName(idx) + '`', [span(n.idx, 'string indices are ranges of `usize`')], ['note: you can use `.chars().nth()` or `.bytes().nth()`', 'note: Rust strings are UTF-8, so one character can span several bytes. Indexing by number is not allowed.']);
+        }
+        if (obj.k === 'map') {
+          const ks = keyOf(idx, n);
+          const e = obj.m.get(ks);
+          if (!e) panic('key not found in map', n);
+          return { get: () => e.v, set: (x) => { e.v = x; }, mutable: false, viaRef, root: base.root, name: srcOf(n) };
+        }
+        throw cerr('E0608', 'cannot index into a value of type `' + typeName(obj) + '`', [span(n)]);
+      }
+      default: return tempPlace(ev(n, env));
+    }
+  }
+  function rangeBounds(r, len, n, unit) {
+    const lo = r.lo ? Number(deref(r.lo).v) : 0;
+    let hi = r.hi ? Number(deref(r.hi).v) + (r.incl ? 1 : 0) : len;
+    if (lo > hi) panic((unit === 'byte' ? 'begin <= end (' : 'slice index starts at ') + lo + (unit === 'byte' ? ' <= ' + hi + ') when slicing string' : ' but ends at ' + hi), n);
+    if (hi > len) panic(unit === 'byte' ? 'byte index ' + hi + ' is out of bounds of string of length ' + len : 'range end index ' + hi + ' out of range for slice of length ' + len, n);
+    return [lo, hi];
+  }
+  function rootCellOf(n, env) {
+    switch (n.k) {
+      case 'path': return n.segs.length === 1 ? env.lookup(n.segs[0]) : null;
+      case 'field': case 'index': return rootCellOf(n.e, env);
+      case 'paren': return rootCellOf(n.e, env);
+      case 'mcall': if (REF_RETURNING.has(n.name) || LAZY_ADAPTORS.has(n.name)) return rootCellOf(n.recv, env); return null;
+      default: return null;
+    }
+  }
+  function requireMut(pl, n, recvNode, what) {
+    if (pl.mutable) return;
+    if (pl.viaRef === 'shared') {
+      const nm = pl.refName || srcOf(recvNode);
+      throw cerr('E0596', 'cannot ' + (what || 'borrow') + ' `' + (pl.rcVia ? 'data in an `Rc`' : '*' + nm.replace(/^\*/, '')) + '` as mutable' + (pl.rcVia ? '' : ', as it is behind a `&` reference'), [span(recvNode, '`' + nm + '` is a `&` reference, so the data it refers to cannot be borrowed as mutable')], pl.rcVia ? ['help: `Rc` only gives shared access. Wrap the value in `RefCell` (or `Mutex` across threads) to mutate it'] : ['help: change the parameter or binding to a mutable reference: `&mut`']);
+    }
+    const cell = pl.root || pl.cell;
+    if (cell) {
+      const labels = [span(recvNode, 'cannot borrow as mutable')];
+      if (cell.decl) labels.unshift({ pos: cell.decl.pos, end: cell.decl.end, text: 'help: consider changing this to be mutable: `mut ' + cell.name + '`', primary: false });
+      throw cerr('E0596', 'cannot borrow `' + srcOf(recvNode) + '` as mutable, as `' + cell.name + '` is not declared as mutable', labels);
+    }
+  }
+
+  // ---- coercion & type checking ----
+  function mismatch(expected, found, n, help) {
+    return cerr('E0308', 'mismatched types', [span(n, 'expected `' + expected + '`, found ' + found)], help ? [help] : []);
+  }
+  function foundDesc(v) {
+    switch (v.k) {
+      case 'int': return v.ty ? '`' + v.ty + '`' : 'integer';
+      case 'float': return v.ty ? '`' + v.ty + '`' : 'floating-point number';
+      case 'str': return '`&str`';
+      case 'tuple': return v.items.length ? '`' + typeName(v) + '`' : '`()`';
+      default: return '`' + typeName(v) + '`';
+    }
+  }
+  function coerce(v, ty, n) {
+    if (!ty || !v) return v;
+    ty = resolveTy(ty);
+    if (ty.tk === 'path') {
+      const nm = ty.name;
+      if (INT_BITS[nm]) {
+        if (v.k === 'int') {
+          if (v.ty === nm) return v;
+          if (v.ty && v.ty !== nm) throw mismatch(nm, '`' + v.ty + '`', n, 'help: you can convert with `as ' + nm + '` (or `' + nm + '::try_from(x)` to check the range)');
+          const [lo, hi] = intRange(nm);
+          if (v.v < lo || v.v > hi) {
+            if (n && n.k === 'int' || (n && n.k === 'unary' && n.e.k === 'int')) throw cerr(null, 'literal out of range for `' + nm + '`', [span(n, 'the literal `' + srcOf(n) + '` does not fit into the type `' + nm + '` whose range is `' + lo + '..=' + hi + '`')], ['note: `#[deny(overflowing_literals)]` on by default']);
+            panic('attempt to convert ' + v.v + ' into ' + nm + ' with overflow', n);
+          }
+          return mkInt(v.v, nm);
+        }
+        if (v.k === 'float' || v.k === 'str' || v.k === 'String' || v.k === 'bool' || v.k === 'char' || v.k === 'vec' || v.k === 'struct' || v.k === 'map' || (v.k === 'tuple' && v !== UNIT)) throw mismatch(nm, foundDesc(v), n);
+        if (v.k === 'enum') throw mismatch(nm, foundDesc(v), n, v.en === 'Option' ? 'help: the value is wrapped in `Option`. Use `match`, `if let`, `.unwrap()` or `.unwrap_or(default)` to get the number out' : v.en === 'Result' ? 'help: the value is wrapped in `Result`. Use `?`, `match` or `.unwrap()` to get the number out' : null);
+        if (v === UNIT) throw mismatch(nm, '`()`', n);
+        return v;
+      }
+      if (nm === 'f64' || nm === 'f32') {
+        if (v.k === 'float') { if (v.ty && v.ty !== nm) throw mismatch(nm, '`' + v.ty + '`', n); return v.ty === nm ? v : mkFloat(v.v, nm); }
+        if (v.k === 'int') throw mismatch(nm, foundDesc(v), n, 'help: use a float literal: `' + (n && n.k === 'int' ? n.v + '.0' : 'x as ' + nm) + '`');
+        if (v.k === 'str' || v.k === 'String' || v.k === 'bool' || v.k === 'char') throw mismatch(nm, foundDesc(v), n);
+        return v;
+      }
+      if (nm === 'String') {
+        if (v.k === 'str') throw mismatch('String', '`&str`', n, 'help: try using a conversion method: `.to_string()` or `String::from(...)`');
+        if (v.k === 'int' || v.k === 'float' || v.k === 'bool' || v.k === 'char') throw mismatch('String', foundDesc(v), n);
+        if (v.k === 'ref' && deref(v).k === 'String') throw mismatch('String', '`&String`', n, 'help: try using a conversion method: `.to_string()` or `.clone()`');
+        return v;
+      }
+      if (nm === 'bool' && v.k !== 'bool' && ['int', 'float', 'str', 'String', 'char'].includes(v.k)) throw mismatch('bool', foundDesc(v), n);
+      if (nm === 'char' && v.k !== 'char' && ['int', 'float', 'str', 'String', 'bool'].includes(v.k)) throw mismatch('char', foundDesc(v), n, v.k === 'str' ? "help: if you meant to write a `char` literal, use single quotes: 'a'" : null);
+      if ((nm === 'Vec' || nm === 'VecDeque') && ty.args && ty.args[0]) {
+        if (v.k === 'vec') { if (v.items.length) v.items = v.items.map((x) => coerce(x, ty.args[0], n)); return v; }
+        if (['int', 'float', 'str', 'String', 'bool', 'char'].includes(v.k)) throw mismatch(tyText(ty), foundDesc(v), n);
+      }
+      if (nm === 'Option' && ty.args && ty.args[0]) {
+        if (v.k === 'enum' && v.en === 'Option') { if (v.variant === 'Some') return mkSome(coerce(v.vals[0], ty.args[0], n)); return v; }
+        if (['int', 'float', 'str', 'String', 'bool', 'char'].includes(v.k)) throw mismatch(tyText(ty), foundDesc(v), n, 'help: try wrapping the expression in `Some`');
+      }
+      if (nm === 'Result' && ty.args && ty.args[0]) {
+        if (v.k === 'enum' && v.en === 'Result') { if (v.variant === 'Ok') return mkOk(coerce(v.vals[0], ty.args[0], n)); if (ty.args[1]) return mkErr(coerce(v.vals[0], ty.args[1], n)); return v; }
+        if (['int', 'float', 'str', 'String', 'bool', 'char'].includes(v.k)) throw mismatch(tyText(ty), foundDesc(v), n, 'help: try wrapping the expression in `Ok`');
+      }
+      if (nm === 'Box' && ty.args && ty.args[0] && ty.args[0].tk !== 'dyn') return coerce(v, ty.args[0], n);
+      if ((nm === 'HashMap' || nm === 'BTreeMap') && v.k === 'map' && ty.args && ty.args.length === 2) {
+        for (const e of v.m.values()) { e.k = coerce(e.k, ty.args[0], n); e.v = coerce(e.v, ty.args[1], n); }
+        if (ty.args[1].tk !== 'infer') v.valTy = ty.args[1];
+        if (ty.args[0].tk !== 'infer') v.keyTy = ty.args[0];
+        return v;
+      }
+      if (structs.has(nm) || enums.has(nm)) {
+        if (['int', 'float', 'str', 'String', 'bool', 'char'].includes(v.k)) throw mismatch(nm, foundDesc(v), n);
+      }
+      return v;
+    }
+    if (ty.tk === 'ref') {
+      const inner = resolveTy(ty.inner);
+      if (inner.tk === 'path' && inner.name === 'str') {
+        if (v.k === 'String') throw mismatch('&str', '`String`', n, 'help: consider borrowing here: `&' + (n ? srcOf(n) : 'value') + '`');
+        if (['int', 'float', 'bool', 'char'].includes(v.k)) throw mismatch('&str', foundDesc(v), n);
+        return v;
+      }
+      if (v.k !== 'ref' && v.k !== 'str' && ['int', 'float', 'String', 'bool', 'char', 'vec', 'struct', 'map'].includes(v.k)) {
+        throw mismatch(tyText(ty), foundDesc(v), n, 'help: consider borrowing here: `&' + (n ? srcOf(n) : 'value') + '`');
+      }
+      if (v.k === 'ref' && ty.mut && !v.mut) throw cerr('E0308', 'mismatched types', [span(n, 'types differ in mutability')], ['note: expected mutable reference `' + tyText(ty) + '`, found `&' + typeName(v.place.get()) + '`']);
+      return v;
+    }
+    if (ty.tk === 'tuple' && v.k === 'tuple' && ty.elems.length === v.items.length) {
+      if (!ty.elems.length) return v;
+      return mkTuple(v.items.map((x, i) => coerce(x, ty.elems[i], n)));
+    }
+    if (ty.tk === 'tuple' && ty.elems.length === 0 && v.k !== 'tuple' && !['closure', 'fn'].includes(v.k)) {
+      throw mismatch('()', foundDesc(v), n);
+    }
+    if ((ty.tk === 'array' || ty.tk === 'slice') && v.k === 'vec') { v.items = v.items.map((x) => coerce(x, ty.elem, n)); return v; }
+    return v;
+  }
+
+  // ---- hashing keys ----
+  function keyOf(v, n) {
+    v = deref(v);
+    switch (v.k) {
+      case 'int': return 'i' + v.v;
+      case 'str': case 'String': return 's' + v.v;
+      case 'char': return 'c' + v.v;
+      case 'bool': return 'b' + v.v;
+      case 'tuple': return 't(' + v.items.map((x) => keyOf(x, n)).join(',') + ')';
+      case 'vec': return 'v[' + v.items.map((x) => keyOf(x, n)).join(',') + ']';
+      case 'struct': {
+        if (!derives(v, 'Hash')) throw cerr('E0277', 'the trait bound `' + v.name + ': Hash` is not satisfied', [span(n || { pos: 0, end: 1 }, 'the trait `Hash` is not implemented for `' + v.name + '`')], ['help: add `#[derive(Hash, PartialEq, Eq)]` to `' + v.name + '`']);
+        return v.name + '{' + Object.keys(v.fields).map((k) => k + ':' + keyOf(v.fields[k], n)).join(',') + '}';
+      }
+      case 'enum': return v.en + '::' + v.variant + '(' + (v.fields ? Object.values(v.fields) : v.vals).map((x) => keyOf(x, n)).join(',') + ')';
+      case 'float': throw cerr('E0277', 'the trait bound `f64: Hash` is not satisfied', [span(n || { pos: 0, end: 1 }, 'the trait `Hash` is not implemented for `f64`')], ['note: floating-point numbers cannot be used as map keys because NaN != NaN']);
+      default: return 'x' + typeName(v);
+    }
+  }
+
+  // ---- comparisons ----
+  function valEq(a, b, n) {
+    a = deref(a); b = deref(b);
+    if (a.k === 'int' && b.k === 'int') { if (a.ty && b.ty && a.ty !== b.ty) throw mismatch(a.ty, '`' + b.ty + '`', n); return a.v === b.v; }
+    if (a.k === 'float' && b.k === 'float') return a.v === b.v;
+    if ((a.k === 'int' && b.k === 'float') || (a.k === 'float' && b.k === 'int')) throw mismatch(typeName(a), foundDesc(b), n && n.r ? n.r : n);
+    if ((a.k === 'str' || a.k === 'String') && (b.k === 'str' || b.k === 'String')) return a.v === b.v;
+    if (a.k === 'char' && b.k === 'char') return a.v === b.v;
+    if (a.k === 'bool' && b.k === 'bool') return a.v === b.v;
+    if (a.k === 'tuple' && b.k === 'tuple') return a.items.length === b.items.length && a.items.every((x, i) => valEq(x, b.items[i], n));
+    if (a.k === 'vec' && b.k === 'vec') return a.items.length === b.items.length && a.items.every((x, i) => valEq(x, b.items[i], n));
+    if (a.k === 'struct' || a.k === 'enum') {
+      const key = typeKey(a);
+      const user = findTraitMethod(key, 'PartialEq', 'eq');
+      if (user) return callFn(user, [mkRef(tempPlace(b), false)], mkRef(tempPlace(a), false), key).v;
+      if (!derives(a, 'PartialEq')) throw cerr('E0369', 'binary operation `==` cannot be applied to type `' + typeName(a) + '`', [span(n || { pos: 0, end: 1 })], ['note: an implementation of `PartialEq` might be missing for `' + typeName(a) + '`', 'help: consider annotating `' + typeName(a) + '` with `#[derive(PartialEq)]`']);
+      if (b.k !== a.k) return false;
+      if (a.k === 'struct') return a.name === b.name && Object.keys(a.fields).every((k) => valEq(a.fields[k], b.fields[k], n));
+      if (a.en !== b.en || a.variant !== b.variant) return false;
+      if (a.fields) return Object.keys(a.fields).every((k) => valEq(a.fields[k], b.fields[k], n));
+      return a.vals.every((x, i) => valEq(x, b.vals[i], n));
+    }
+    if (a.k === 'map' && b.k === 'map') { if (a.m.size !== b.m.size) return false; for (const [k, e] of a.m) { const o = b.m.get(k); if (!o || !valEq(e.v, o.v, n)) return false; } return true; }
+    if (a.k === 'set' && b.k === 'set') { if (a.m.size !== b.m.size) return false; for (const k of a.m.keys()) if (!b.m.has(k)) return false; return true; }
+    if (a.k === 'duration' && b.k === 'duration') return a.ns === b.ns;
+    if (a.k === 'stderr' && b.k === 'stderr') return a.debug === b.debug;
+    if (a.k !== b.k) throw mismatch(typeName(a), foundDesc(b), n && n.r ? n.r : n);
+    return a === b;
+  }
+  function variantIndex(v) {
+    if (v.en === 'Option') return v.variant === 'None' ? 0 : 1;
+    if (v.en === 'Result') return v.variant === 'Ok' ? 0 : 1;
+    if (v.en === 'Ordering') return { Less: 0, Equal: 1, Greater: 2 }[v.variant];
+    const d = enums.get(v.en); return d ? d.variants.findIndex((x) => x.name === v.variant) : 0;
+  }
+  function cmpVals(a, b, n, needTotal) {
+    a = deref(a); b = deref(b);
+    if (a.k === 'int' && b.k === 'int') { if (a.ty && b.ty && a.ty !== b.ty) throw mismatch(a.ty, '`' + b.ty + '`', n); return a.v < b.v ? -1 : a.v > b.v ? 1 : 0; }
+    if (a.k === 'float' && b.k === 'float') {
+      if (needTotal) throw cerr('E0277', 'the trait bound `f64: Ord` is not satisfied', [span(n, 'the trait `Ord` is not implemented for `f64`')], ['note: floats are only `PartialOrd` because NaN is not comparable', 'help: use `.sort_by(|a, b| a.partial_cmp(b).unwrap())` or `.max_by(|a, b| a.total_cmp(b))`']);
+      if (Number.isNaN(a.v) || Number.isNaN(b.v)) return NaN;
+      return a.v < b.v ? -1 : a.v > b.v ? 1 : 0;
+    }
+    if ((a.k === 'int' && b.k === 'float') || (a.k === 'float' && b.k === 'int')) throw mismatch(typeName(a), foundDesc(b), n && n.r ? n.r : n);
+    if ((a.k === 'str' || a.k === 'String') && (b.k === 'str' || b.k === 'String')) return a.v < b.v ? -1 : a.v > b.v ? 1 : 0;
+    if (a.k === 'char' && b.k === 'char') { const x = a.v.codePointAt(0), y = b.v.codePointAt(0); return x < y ? -1 : x > y ? 1 : 0; }
+    if (a.k === 'bool' && b.k === 'bool') return (a.v ? 1 : 0) - (b.v ? 1 : 0);
+    if ((a.k === 'tuple' && b.k === 'tuple') || (a.k === 'vec' && b.k === 'vec')) {
+      for (let i = 0; i < Math.min(a.items.length, b.items.length); i++) { const c = cmpVals(a.items[i], b.items[i], n, needTotal); if (c !== 0) return c; }
+      return a.items.length - b.items.length;
+    }
+    if (a.k === 'struct' || a.k === 'enum') {
+      const key = typeKey(a);
+      const user = findTraitMethod(key, needTotal ? 'Ord' : 'PartialOrd', needTotal ? 'cmp' : 'partial_cmp') || findTraitMethod(key, 'Ord', 'cmp') || findTraitMethod(key, 'PartialOrd', 'partial_cmp');
+      if (user) {
+        let r = callFn(user, [mkRef(tempPlace(b), false)], mkRef(tempPlace(a), false), key);
+        if (r.en === 'Option') r = r.vals[0];
+        return variantIndex(r) - 1;
+      }
+      if (!derives(a, 'PartialOrd')) throw cerr('E0369', 'binary operation `<` cannot be applied to type `' + typeName(a) + '`', [span(n || { pos: 0, end: 1 })], ['help: consider annotating `' + typeName(a) + '` with `#[derive(PartialEq, PartialOrd)]`']);
+      if (a.k === 'struct') { for (const k of Object.keys(a.fields)) { const c = cmpVals(a.fields[k], b.fields[k], n, needTotal); if (c !== 0) return c; } return 0; }
+      const vi = variantIndex(a) - variantIndex(b);
+      if (vi !== 0) return vi;
+      const xs = a.fields ? Object.values(a.fields) : a.vals; const ys = b.fields ? Object.values(b.fields) : b.vals;
+      for (let i = 0; i < xs.length; i++) { const c = cmpVals(xs[i], ys[i], n, needTotal); if (c !== 0) return c; }
+      return 0;
+    }
+    if (a.k === 'duration' && b.k === 'duration') return a.ns - b.ns;
+    throw cerr('E0369', 'binary operation `<` cannot be applied to type `' + typeName(a) + '`', [span(n || { pos: 0, end: 1 })]);
+  }
+
+  // ---- formatting ----
+  function userFmt(v, trait) {
+    const key = typeKey(v);
+    const m = findTraitMethod(key, trait, 'fmt');
+    if (!m) return null;
+    const f = { k: 'fmt', buf: [] };
+    const r = callFn(m, [mkRef(tempPlace(f), true)], mkRef(tempPlace(v), false), key);
+    if (r && r.k === 'enum' && r.variant === 'Err') panic('a Display implementation returned an error unexpectedly: Error', null);
+    return f.buf.join('');
+  }
+  function noDisplay(v, n) {
+    const tn = typeName(v);
+    const notes = ['note: the trait `std::fmt::Display` is not implemented for `' + tn + '`', 'note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead'];
+    if (v.k === 'struct' || (v.k === 'enum' && !['Option', 'Result'].includes(v.en))) notes.push('help: implement `std::fmt::Display` for `' + tn + '` to control how it prints');
+    return cerr('E0277', '`' + tn + '` doesn\'t implement `std::fmt::Display`', [span(n || { pos: 0, end: 1 }, '`' + tn + '` cannot be formatted with the default formatter')], notes);
+  }
+  function display(v, n) {
+    v = deref(v);
+    switch (v.k) {
+      case 'int': return v.v.toString();
+      case 'float': return floatDisplay(v.v, v.ty, null);
+      case 'str': case 'String': return v.v;
+      case 'char': return v.v;
+      case 'bool': return v.v ? 'true' : 'false';
+      case 'stderr': return v.display;
+      case 'iter': if (v.info === 'CaseMapping') { let s = ''; let x; while ((x = v.next()) !== DONE) s += x.v; return s; } break;
+      case 'struct': case 'enum': { const s = userFmt(v, 'Display'); if (s !== null) return s; break; }
+    }
+    throw noDisplay(v, n);
+  }
+  function debug(v, pretty, ind, n) {
+    v = derefRefs(v);
+    const I = ind + '    ';
+    const seq = (open, close, parts) => {
+      if (!parts.length) return open + close;
+      if (!pretty) return open + parts.join(', ') + close;
+      return open + '\n' + parts.map((p) => I + p + ',\n').join('') + ind + close;
+    };
+    const fieldsFmt = (name, entries) => {
+      if (!entries.length) return name;
+      if (!pretty) return name + ' { ' + entries.map(([k, x]) => k + ': ' + debug(x, false, '', n)).join(', ') + ' }';
+      return name + ' {\n' + entries.map(([k, x]) => I + k + ': ' + debug(x, true, I, n) + ',\n').join('') + ind + '}';
+    };
+    switch (v.k) {
+      case 'int': return v.v.toString();
+      case 'float': return floatDebug(v.v, v.ty);
+      case 'str': case 'String': return '"' + escapeDebug(v.v, '"') + '"';
+      case 'char': return "'" + escapeDebug(v.v, "'") + "'";
+      case 'bool': return v.v ? 'true' : 'false';
+      case 'tuple': {
+        if (!v.items.length) return '()';
+        const parts = v.items.map((x) => debug(x, pretty, I, n));
+        if (!pretty && parts.length === 1) return '(' + parts[0] + ',)';
+        return seq('(', ')', parts);
+      }
+      case 'vec': {
+        const parts = v.items.map((x) => debug(x, pretty, I, n));
+        return seq('[', ']', parts);
+      }
+      case 'map': {
+        let ents = [...v.m.values()];
+        if (v.kind === 'BTreeMap') ents.sort((a, b) => cmpVals(a.k, b.k, n));
+        const parts = ents.map((e) => debug(e.k, pretty, I, n) + ': ' + debug(e.v, pretty, I, n));
+        return seq('{', '}', parts);
+      }
+      case 'set': {
+        let ents = [...v.m.values()];
+        if (v.kind === 'BTreeSet') ents.sort((a, b) => cmpVals(a, b, n));
+        return seq('{', '}', ents.map((e) => debug(e, pretty, I, n)));
+      }
+      case 'struct': {
+        const u = userFmt(v, 'Debug'); if (u !== null) return u;
+        const def = structs.get(v.name);
+        if (!def || !def.derives.has('Debug')) throw cerr('E0277', '`' + v.name + '` doesn\'t implement `Debug`', [span(n || { pos: 0, end: 1 }, '`' + v.name + '` cannot be formatted using `{:?}`')], ['help: the trait `Debug` is not implemented for `' + v.name + '`', 'help: add `#[derive(Debug)]` to `' + v.name + '` or manually `impl Debug for ' + v.name + '`']);
+        if (def.kind === 'unit') return v.name;
+        if (def.kind === 'tuple') return seq(v.name + '(', ')', def.fields.map((f) => debug(v.fields[f.name], pretty, I, n)));
+        return fieldsFmt(v.name, def.fields.map((f) => [f.name, v.fields[f.name]]));
+      }
+      case 'enum': {
+        if (!['Option', 'Result', 'Ordering'].includes(v.en)) {
+          const u = userFmt(v, 'Debug'); if (u !== null) return u;
+          const def = enums.get(v.en);
+          if (!def || !def.derives.has('Debug')) throw cerr('E0277', '`' + v.en + '` doesn\'t implement `Debug`', [span(n || { pos: 0, end: 1 }, '`' + v.en + '` cannot be formatted using `{:?}`')], ['help: add `#[derive(Debug)]` to `' + v.en + '` or manually `impl Debug for ' + v.en + '`']);
+        }
+        if (v.fields) return fieldsFmt(v.variant, Object.entries(v.fields));
+        if (!v.vals.length) return v.variant;
+        return seq(v.variant + '(', ')', v.vals.map((x) => debug(x, pretty, I, n)));
+      }
+      case 'rc': return debug(v.cell.val, pretty, ind, n);
+      case 'cell': {
+        if (v.kind === 'Mutex') return fieldsFmt('Mutex', [['data', v.place.val], ['poisoned', FALSE]]).replace(/ \}$/, ', .. }');
+        if (v.kind === 'RefCell') return fieldsFmt('RefCell', [['value', v.place.val]]);
+        return fieldsFmt(v.kind, [['value', v.place.val]]);
+      }
+      case 'stderr': return v.debug;
+      case 'duration': return durationDebug(v.ns);
+      case 'instant': return 'Instant { .. }';
+      case 'range': return (v.lo ? debug(v.lo, false, '', n) : '') + (v.incl ? '..=' : '..') + (v.hi ? debug(v.hi, false, '', n) : '');
+      case 'iter': return v.info + ' { .. }';
+      case 'closure': case 'fn': case 'bfn': throw cerr('E0277', '`' + typeName(v) + '` doesn\'t implement `Debug`', [span(n || { pos: 0, end: 1 })]);
+      case 'fmt': return 'Formatter { .. }';
+      default: return '<' + v.k + '>';
+    }
+  }
+  function padStr(s, spec, numeric) {
+    const width = spec.width || 0;
+    const len = Array.from(s).length;
+    if (len >= width) return s;
+    const fill = spec.fill || ' ';
+    const align = spec.align || (numeric ? '>' : '<');
+    const padN = width - len;
+    if (align === '<') return s + fill.repeat(padN);
+    if (align === '>') return fill.repeat(padN) + s;
+    const left = Math.floor(padN / 2); return fill.repeat(left) + s + fill.repeat(padN - left);
+  }
+  function formatArg(v, spec, n) {
+    const d = deref(v);
+    let s; let numeric = false;
+    const ty = spec.ty;
+    if ((ty === 'x' || ty === 'X' || ty === 'o' || ty === 'b' || ty === 'x?' || ty === 'X?') && d.k === 'int') {
+      let val = d.v;
+      if (val < 0n) val = BigInt.asUintN(INT_BITS[d.ty || 'i32'], val);
+      const base = { x: 16, X: 16, 'x?': 16, 'X?': 16, o: 8, b: 2 }[ty];
+      s = val.toString(base); if (ty[0] === 'X') s = s.toUpperCase();
+      const prefix = spec.alt ? { x: '0x', X: '0x', 'x?': '0x', 'X?': '0x', o: '0o', b: '0b' }[ty] : '';
+      if (spec.zero && spec.width) s = s.padStart(spec.width - prefix.length, '0');
+      return padStr(prefix + s, spec, true);
+    }
+    if (ty === 'e' || ty === 'E') {
+      let num = d.k === 'int' ? Number(d.v) : d.v;
+      s = spec.prec !== null ? num.toExponential(spec.prec) : num.toExponential();
+      s = s.replace('e+', 'e'); if (ty === 'E') s = s.toUpperCase();
+      return padStr(s, spec, true);
+    }
+    if (ty === '' || ty === '?') {
+      if (d.k === 'int' || d.k === 'float') {
+        numeric = true;
+        if (d.k === 'int') s = d.v.toString();
+        else s = spec.prec !== null ? floatDisplay(d.v, d.ty, spec.prec) : (ty === '?' ? floatDebug(d.v, d.ty) : floatDisplay(d.v, d.ty, null));
+        let sign = '';
+        if (s[0] === '-') { sign = '-'; s = s.slice(1); }
+        else if (spec.sign === '+') sign = '+';
+        if (spec.zero && spec.width) return sign + s.padStart(spec.width - sign.length, '0');
+        return padStr(sign + s, spec, true);
+      }
+      if (ty === '?') {
+        s = debug(v, spec.alt, '', n);
+        return padStr(s, spec, false);
+      }
+      if ((d.k === 'struct' || d.k === 'enum') && findTraitMethod(typeKey(d), 'Display', 'fmt')) return display(d, n);
+      s = display(d, n);
+      if (spec.prec !== null && (d.k === 'str' || d.k === 'String')) s = Array.from(s).slice(0, spec.prec).join('');
+      return padStr(s, spec, false);
+    }
+    if (ty === 'p') return '0x' + (Math.floor(Math.random() * 1e12)).toString(16);
+    return display(d, n);
+  }
+  function runFmt(n, env) {
+    const pieces = n.fmt; if (!pieces) return '';
+    const idx = n.fmtIndex;
+    const positional = n.args.slice(idx + 1).map((a) => evOperand(a, env, 'borrow'));
+    const named = {};
+    for (const k in n.named) named[k] = evOperand(n.named[k], env, 'borrow');
+    for (const k in n.implicit) named[k] = evPath(n.implicit[k], env, null, 'borrow');
+    const get = (ref) => (ref.kind === 'index' ? positional[ref.v] : named[ref.v]);
+    let s = '';
+    for (const pc of pieces) {
+      if (typeof pc === 'string') { s += pc; continue; }
+      const v = get(pc.arg);
+      let spec = pc.spec;
+      if (spec.widthArg || spec.precArg) {
+        spec = Object.assign({}, spec);
+        if (spec.widthArg) spec.width = Number(deref(get(spec.widthArg)).v);
+        if (spec.precArg) spec.prec = Number(deref(get(spec.precArg)).v);
+      }
+      s += formatArg(v, spec, pc.arg.kind === 'index' ? n.args[idx + 1 + pc.arg.v] : (n.named[pc.arg.v] || n.implicit[pc.arg.v]));
+    }
+    return s;
+  }
+  function write(s, stream) {
+    outLen += s.length;
+    if (outLen > 200000) { out.push({ s: '\n[output truncated: more than 200,000 characters]\n', t: 'note' }); throw new LimitError('output'); }
+    const last = out[out.length - 1];
+    if (last && last.t === stream) last.s += s; else out.push({ s, t: stream });
+  }
+
+  // ---- paths ----
+  function stripStd(segs) {
+    let s = segs.slice();
+    while (s.length > 1 && ['std', 'core', 'crate', 'self', 'super', 'alloc'].includes(s[0])) s.shift();
+    // module path prefixes from std
+    const mods = ['collections', 'rc', 'cell', 'sync', 'thread', 'mpsc', 'time', 'mem', 'cmp', 'fmt', 'io', 'process', 'iter', 'string', 'vec', 'convert', 'ops', 'num', 'char', 'f64', 'f32', 'consts', 'atomic', 'hash', 'error', 'str'];
+    return s;
+  }
+  function selfTypeOf(env) { return env.selfType || null; }
+  function evPath(n, env, ty, mode) {
+    const segs = n.segs;
+    if (segs.length === 1) {
+      const name = segs[0];
+      const cell = env.lookup(name);
+      if (cell) {
+        const v = readVar(cell, n, mode || 'read');
+        return v;
+      }
+      return globalValue([name], n, env, ty);
+    }
+    return globalValue(segs, n, env, ty);
+  }
+  const INT_CONSTS = (ty, name) => {
+    if (INT_BITS[ty]) { const [lo, hi] = intRange(ty); if (name === 'MAX') return mkInt(hi, ty); if (name === 'MIN') return mkInt(lo, ty); if (name === 'BITS') return mkInt(BigInt(INT_BITS[ty]), 'u32'); }
+    if (ty === 'f64' || ty === 'f32') {
+      const t = { MAX: ty === 'f32' ? 3.4028234663852886e38 : Number.MAX_VALUE, MIN: ty === 'f32' ? -3.4028234663852886e38 : -Number.MAX_VALUE, EPSILON: ty === 'f32' ? 1.1920929e-7 : Number.EPSILON, INFINITY: Infinity, NEG_INFINITY: -Infinity, NAN: NaN, MIN_POSITIVE: ty === 'f32' ? 1.1754944e-38 : 2.2250738585072014e-308, PI: Math.PI, E: Math.E, TAU: Math.PI * 2, SQRT_2: Math.SQRT2, LN_2: Math.LN2, LN_10: Math.LN10, FRAC_PI_2: Math.PI / 2, FRAC_PI_4: Math.PI / 4 };
+      if (name in t) return mkFloat(t[name], ty);
+    }
+    return null;
+  };
+  function globalValue(segsIn, n, env, ty) {
+    let segs = stripStd(segsIn);
+    if (segs[0] === 'Self' && env.selfType) segs = [env.selfType].concat(segs.slice(1));
+    const last = segs[segs.length - 1];
+    if (segs.length === 1) {
+      const name = segs[0];
+      if (G.aliases.has(name)) { const p = G.aliases.get(name); if (p.join('::') !== name) return globalValue(p, n, env, ty); }
+      if (name === 'None') return mkNone();
+      if (name === 'Some') return bfn('Some', (a) => mkSome(a[0]));
+      if (name === 'Ok') return bfn('Ok', (a) => mkOk(a[0]));
+      if (name === 'Err') return bfn('Err', (a) => mkErr(a[0]));
+      if (name === 'drop') return bfn('drop', () => UNIT);
+      const f = G.fns.get(name) || fnBySuffix(name);
+      if (f) return { k: 'fn', decl: f };
+      if (G.consts.has(name)) return constValue(name, G.consts.get(name));
+      const sd = structs.get(name);
+      if (sd) {
+        if (sd.kind === 'unit') return { k: 'struct', name, fields: {} };
+        if (sd.kind === 'tuple') return bfn(name, (a, cn) => { if (a.length !== sd.fields.length) throw cerr('E0061', 'this struct takes ' + sd.fields.length + ' argument' + (sd.fields.length === 1 ? '' : 's') + ' but ' + a.length + ' were supplied', [span(cn)]); const fl = {}; sd.fields.forEach((fd, i) => { fl[fd.name] = coerce(a[i], fd.ty, cn && cn.args ? cn.args[i] : cn); }); return { k: 'struct', name, fields: fl }; }, sd.fields.map((x) => x.ty));
+      }
+      if (INT_BITS[name] || name === 'f64' || name === 'f32') return { k: 'typeval', name };
+      throw cerr('E0425', 'cannot find value `' + name + '` in this scope', [span(n, 'not found in this scope')]);
+    }
+    // module function
+    const joined = segs.join('::');
+    if (G.fns.has(joined)) return { k: 'fn', decl: G.fns.get(joined) };
+    { const f = fnBySuffix(joined); if (f) return { k: 'fn', decl: f }; }
+    if (G.consts.has(segs[segs.length - 1]) && G.mods.has(segs[0])) return constValue(segs[segs.length - 1], G.consts.get(segs[segs.length - 1]));
+    if (G.consts.has(joined)) return constValue(joined, G.consts.get(joined));
+    const head = segs[segs.length - 2];
+    // primitive consts: i32::MAX, f64::consts::PI, std::f64::consts::PI
+    {
+      let tyName = segs[0];
+      if (segs.length === 3 && segs[1] === 'consts') tyName = segs[0];
+      const c = INT_CONSTS(tyName, last); if (c) return c;
+      if (segs[0] === 'consts') { const c2 = INT_CONSTS('f64', last); if (c2) return c2; }
+    }
+    // enum variants
+    const en = enums.get(head);
+    if (en) {
+      const vdef = en.variants.find((x) => x.name === last);
+      if (vdef) {
+        if (vdef.kind === 'unit') return { k: 'enum', en: head, variant: last, vals: [] };
+        if (vdef.kind === 'tuple') return bfn(head + '::' + last, (a, cn) => { if (a.length !== vdef.fields.length) throw cerr('E0061', 'this enum variant takes ' + vdef.fields.length + ' argument' + (vdef.fields.length === 1 ? '' : 's') + ' but ' + a.length + ' ' + (a.length === 1 ? 'argument was' : 'arguments were') + ' supplied', [span(cn)]); return { k: 'enum', en: head, variant: last, vals: a.map((x, i) => coerce(x, vdef.fields[i].ty, cn && cn.args ? cn.args[i] : cn)) }; }, vdef.fields.map((x) => x.ty));
+        throw cerr('E0533', 'expected value, found struct variant `' + head + '::' + last + '`', [span(n, 'not a value')], ['help: use struct literal syntax: `' + head + '::' + last + ' { .. }`']);
+      }
+    }
+    if (head === 'Ordering' && ['Less', 'Equal', 'Greater'].includes(last)) return mkOrd({ Less: -1, Equal: 0, Greater: 1 }[last]);
+    if (head === 'Ordering' && ['SeqCst', 'Relaxed', 'Acquire', 'Release', 'AcqRel'].includes(last)) return UNIT;
+    if (head === 'Option' && last === 'None') return mkNone();
+    if (head === 'Option' && last === 'Some') return bfn('Some', (a) => mkSome(a[0]));
+    if (head === 'Result' && (last === 'Ok' || last === 'Err')) return bfn(last, (a) => (last === 'Ok' ? mkOk(a[0]) : mkErr(a[0])));
+    // user associated fns / consts
+    const userKey = typeAliases.has(head) ? tyKey(typeAliases.get(head)) : head;
+    const ie = impls.get(userKey);
+    if (ie) {
+      const f = ie.inherent.get(last) || (ie.traitImpls.map((t) => t.methods.get(last)).find(Boolean));
+      if (f) return { k: 'fn', decl: f, implTy: userKey };
+      const c = ie.consts.get(last);
+      if (c) return constValue(userKey + '::' + last, c, userKey);
+    }
+    // trait static call: Trait::method(x)
+    if (traits.has(head)) {
+      return bfn(joined, (a, cn) => {
+        const self = deref(a[0]);
+        const m = findTraitMethod(typeKey(self), head, last) || findMethod(typeKey(self), last);
+        if (!m) throw cerr('E0599', 'no function `' + last + '` for `' + typeName(self) + '`', [span(cn)]);
+        return callFn(m, a.slice(1), m.selfParam && !m.selfParam.ref ? self : a[0], typeKey(self));
+      });
+    }
+    if (structs.has(userKey) || enums.has(userKey)) {
+      if (last === 'default') return bfn('default', () => defaultFor({ tk: 'path', name: userKey, args: [] }, n));
+      throw cerr('E0599', 'no function or associated item named `' + last + '` found for ' + (structs.has(userKey) ? 'struct' : 'enum') + ' `' + userKey + '` in the current scope', [span(n, 'function or associated item not found in `' + userKey + '`')]);
+    }
+    const b = stdPath(segs, n, env, ty);
+    if (b) return b;
+    if (G.mods.has(segs[0])) throw cerr('E0425', 'cannot find function `' + last + '` in module `' + segs.slice(0, -1).join('::') + '`', [span(n, 'not found in `' + segs.slice(0, -1).join('::') + '`')]);
+    throw cerr('E0433', 'failed to resolve: use of undeclared type or module `' + segs.slice(0, -1).join('::') + '`', [span(n, 'not available in the teaching interpreter (or misspelled)')], ['help: try the Rust Playground button to run this with the full standard library']);
+  }
+  function fnBySuffix(name) {
+    let found = null;
+    for (const [k, f] of G.fns) if (k.endsWith('::' + name)) { if (found && found !== f) return null; found = f; }
+    return found;
+  }
+  function constValue(key, item, selfTy) {
+    if (constCells.has(key)) { const c = constCells.get(key); return item.kind === 'static' ? c.val : copyVal(c.val); }
+    const env = new Env(null); env.selfType = selfTy || null;
+    const v = coerce(ev(item.expr, env, item.ty), item.ty, item.expr);
+    const cell = { name: item.name, val: v, mut: true, init: true };
+    constCells.set(key, cell);
+    return v;
+  }
+  function bfn(name, call, paramTys) { return { k: 'bfn', name, call, paramTys }; }
+  function defaultFor(ty, n) {
+    ty = resolveTy(ty);
+    if (!ty) return mkInt(0n, null);
+    if (ty.tk === 'tuple') return mkTuple(ty.elems.map((t) => defaultFor(t, n)));
+    if (ty.tk === 'array') return mkVec([], 'array');
+    if (ty.tk !== 'path') return UNIT;
+    const nm = ty.name;
+    if (INT_BITS[nm]) return mkInt(0n, nm);
+    if (nm === 'f64' || nm === 'f32') return mkFloat(0, nm);
+    if (nm === 'bool') return FALSE;
+    if (nm === 'char') return mkChar('\0');
+    if (nm === 'String') return mkString('');
+    if (nm === 'str') return mkStr('');
+    if (nm === 'Vec' || nm === 'VecDeque') return mkVec([], nm);
+    if (nm === 'HashMap' || nm === 'BTreeMap') return { k: 'map', kind: nm, m: new Map() };
+    if (nm === 'HashSet' || nm === 'BTreeSet') return { k: 'set', kind: nm, m: new Map() };
+    if (nm === 'Option') return mkNone();
+    const user = findTraitMethod(nm, 'Default', 'default');
+    if (user) return callFn(user, [], undefined, nm);
+    const sd = structs.get(nm);
+    if (sd) {
+      if (!sd.derives.has('Default')) throw cerr('E0277', 'the trait bound `' + nm + ': Default` is not satisfied', [span(n || { pos: 0, end: 1 }, 'the trait `Default` is not implemented for `' + nm + '`')], ['help: consider annotating `' + nm + '` with `#[derive(Default)]`']);
+      const f = {}; sd.fields.forEach((fd) => { f[fd.name] = defaultFor(fd.ty, n); });
+      return { k: 'struct', name: nm, fields: f };
+    }
+    return mkInt(0n, null);
+  }
+  function mkMapFrom(kind, pairs, n) {
+    const m = new Map();
+    for (const p of pairs) { const t = deref(p); m.set(keyOf(t.items[0], n), { k: t.items[0], v: t.items[1] }); }
+    return { k: 'map', kind, m };
+  }
+  function stdPath(segs, n, env, ty) {
+    const last = segs[segs.length - 1]; const head = segs.length >= 2 ? segs[segs.length - 2] : null;
+    const key = head + '::' + last;
+    const ret = (f) => bfn(key, f);
+    switch (key) {
+      case 'String::new': return ret(() => mkString(''));
+      case 'String::from': return ret((a) => { const v = deref(a[0]); if (v.k === 'char') return mkString(v.v); if (v.k !== 'str' && v.k !== 'String') throw mismatch('&str', foundDesc(v), n); return mkString(v.v); });
+      case 'String::with_capacity': return ret(() => mkString(''));
+      case 'String::from_utf8': return ret((a) => { const v = deref(a[0]); try { return mkOk(mkString(new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(v.items.map((x) => Number(deref(x).v)))))); } catch (e) { return mkErr(mkStdErr('FromUtf8Error', 'FromUtf8Error { .. }', 'invalid utf-8 sequence')); } });
+      case 'String::from_utf8_lossy': return ret((a) => { const v = deref(a[0]); return mkString(new TextDecoder('utf-8').decode(new Uint8Array(v.items.map((x) => Number(deref(x).v))))); });
+      case 'Vec::new': case 'Vec::with_capacity': return ret(() => mkVec([], 'Vec'));
+      case 'Vec::from': return ret((a) => { const v = deref(a[0]); if (v.k === 'str' || v.k === 'String') return mkVec(Array.from(new TextEncoder().encode(v.v)).map((b) => mkInt(BigInt(b), 'u8'))); return mkVec(v.items.map((x) => x), 'Vec'); });
+      case 'VecDeque::new': case 'VecDeque::with_capacity': return ret(() => mkVec([], 'VecDeque'));
+      case 'VecDeque::from': return ret((a) => mkVec(deref(a[0]).items.slice(), 'VecDeque'));
+      case 'HashMap::new': case 'HashMap::with_capacity': return ret(() => ({ k: 'map', kind: 'HashMap', m: new Map() }));
+      case 'BTreeMap::new': return ret(() => ({ k: 'map', kind: 'BTreeMap', m: new Map() }));
+      case 'HashMap::from': case 'BTreeMap::from': return ret((a) => mkMapFrom(head, deref(a[0]).items, n));
+      case 'HashSet::new': case 'HashSet::with_capacity': return ret(() => ({ k: 'set', kind: 'HashSet', m: new Map() }));
+      case 'BTreeSet::new': return ret(() => ({ k: 'set', kind: 'BTreeSet', m: new Map() }));
+      case 'HashSet::from': case 'BTreeSet::from': return ret((a) => { const m = new Map(); for (const x of deref(a[0]).items) m.set(keyOf(x, n), x); return { k: 'set', kind: head, m }; });
+      case 'Box::new': return ret((a) => a[0]);
+      case 'Rc::new': case 'Arc::new': return ret((a) => ({ k: 'rc', kind: head, cell: { val: a[0], strong: 1 } }));
+      case 'Rc::clone': case 'Arc::clone': return ret((a) => { const r = derefRefs(a[0]); r.cell.strong++; return { k: 'rc', kind: r.kind, cell: r.cell }; });
+      case 'Rc::strong_count': case 'Arc::strong_count': return ret((a) => usize(derefRefs(a[0]).cell.strong));
+      case 'Rc::ptr_eq': case 'Arc::ptr_eq': return ret((a) => mkBool(derefRefs(a[0]).cell === derefRefs(a[1]).cell));
+      case 'RefCell::new': case 'Cell::new': case 'Mutex::new': case 'RwLock::new': return ret((a) => ({ k: 'cell', kind: head, place: { val: a[0] }, borrows: 0, mutBorrowed: false }));
+      case 'AtomicUsize::new': case 'AtomicI32::new': case 'AtomicU64::new': case 'AtomicBool::new': case 'AtomicI64::new': case 'AtomicU32::new': return ret((a) => ({ k: 'cell', kind: 'Atomic', place: { val: a[0] } }));
+      case 'thread::spawn': return ret((a, cn) => {
+        const f = a[0];
+        if (f.k === 'closure' && !f.node.move) {
+          const caps = [...f.node.captures].filter((nm) => f.env.lookup(nm));
+          if (caps.length) {
+            const nm = caps[0];
+            throw cerr('E0373', 'closure may outlive the current function, but it borrows `' + nm + '`, which is owned by the current function', [{ pos: f.node.pos, end: f.node.pos + 2, text: 'may outlive borrowed value `' + nm + '`', primary: true }], ['note: function requires argument type to outlive `\'static`', 'help: to force the closure to take ownership of `' + nm + '` (and any other referenced variables), use the `move` keyword: `move ||`']);
+          }
+        }
+        let result, panicked = null;
+        try { result = callValue(f, [], cn); } catch (e) { if (e instanceof Panic) { panicked = e; write("thread '<unnamed>' panicked at src/main.rs:" + lineCol(e.pos).join(':') + ':\n' + e.msg + '\n', 'err'); } else throw e; }
+        return { k: 'handle', result, panicked };
+      });
+      case 'thread::sleep': return ret(() => UNIT);
+      case 'thread::current': return ret(() => ({ k: 'threadinfo' }));
+      case 'mpsc::channel': case 'mpsc::sync_channel': return ret(() => { const ch = { q: [] }; return mkTuple([{ k: 'sender', ch }, { k: 'receiver', ch }]); });
+      case 'Duration::from_secs': return ret((a) => ({ k: 'duration', ns: Number(deref(a[0]).v) * 1e9 }));
+      case 'Duration::from_millis': return ret((a) => ({ k: 'duration', ns: Number(deref(a[0]).v) * 1e6 }));
+      case 'Duration::from_micros': return ret((a) => ({ k: 'duration', ns: Number(deref(a[0]).v) * 1e3 }));
+      case 'Duration::from_nanos': return ret((a) => ({ k: 'duration', ns: Number(deref(a[0]).v) }));
+      case 'Duration::from_secs_f64': case 'Duration::from_secs_f32': return ret((a) => ({ k: 'duration', ns: deref(a[0]).v * 1e9 }));
+      case 'Instant::now': return ret(() => ({ k: 'instant', t: now() }));
+      case 'mem::swap': return ret((a) => { const x = a[0], y = a[1]; const t = x.place.get(); x.place.set(y.place.get()); y.place.set(t); return UNIT; });
+      case 'mem::replace': return ret((a) => { const old = a[0].place.get(); a[0].place.set(a[1]); return old; });
+      case 'mem::take': return ret((a, cn) => { const old = a[0].place.get(); a[0].place.set(defaultLike(old, cn)); return old; });
+      case 'mem::drop': return ret(() => UNIT);
+      case 'mem::size_of': return ret(() => { const g = n.generics && n.generics[0]; const s = g ? sizeOfTy(g) : 0; return usize(s); });
+      case 'cmp::max': return ret((a, cn) => (cmpVals(a[1], a[0], cn, true) >= 0 ? a[1] : a[0]));
+      case 'cmp::min': return ret((a, cn) => (cmpVals(a[0], a[1], cn, true) <= 0 ? a[0] : a[1]));
+      case 'process::exit': return ret((a) => { throw new ExitSig(Number(deref(a[0]).v)); });
+      case 'io::stdin': return ret(() => ({ k: 'stdin' }));
+      case 'io::stdout': return ret(() => ({ k: 'stdout' }));
+      case 'char::from_u32': return ret((a) => { const c = Number(deref(a[0]).v); return (c >= 0 && c <= 0x10ffff && !(c >= 0xd800 && c <= 0xdfff)) ? mkSome(mkChar(String.fromCodePoint(c))) : mkNone(); });
+      case 'char::from_digit': return ret((a) => { const d = Number(deref(a[0]).v), r = Number(deref(a[1]).v); return d < r ? mkSome(mkChar(d.toString(r))) : mkNone(); });
+      case 'char::from': return ret((a) => mkChar(String.fromCodePoint(Number(deref(a[0]).v))));
+      case 'iter::repeat': return ret((a) => new It(() => cloneVal(a[0], n), 'Repeat'));
+      case 'iter::once': return ret((a) => itFromArray([a[0]], 'Once'));
+      case 'iter::empty': return ret(() => itFromArray([], 'Empty'));
+      case 'iter::from_fn': return ret((a, cn) => new It(() => { const r = callValue(a[0], [], cn); return r.variant === 'Some' ? r.vals[0] : DONE; }, 'FromFn'));
+      case 'iter::successors': return ret((a, cn) => { let cur = a[0]; return new It(() => { if (cur.variant !== 'Some') return DONE; const v = cur.vals[0]; cur = callValue(a[1], [mkRef(tempPlace(v), false)], cn); return v; }, 'Successors'); });
+      case 'Default::default': return ret(() => defaultFor(ty, n));
+    }
+    // int/float associated functions & UFCS on builtin types: i32::from, u64::try_from, f64::sqrt(x), str::len(s)
+    if (INT_BITS[head] || head === 'f64' || head === 'f32') {
+      if (last === 'from') return ret((a) => { const v = deref(a[0]); if (head[0] === 'f') return mkFloat(v.k === 'int' ? Number(v.v) : v.v, head); if (v.k === 'char') return mkInt(BigInt(v.v.codePointAt(0)), head); if (v.k === 'bool') return mkInt(v.v ? 1n : 0n, head); return mkInt(v.v, head); });
+      if (last === 'try_from') return ret((a) => { const v = deref(a[0]); const [lo, hi] = intRange(head); return v.v >= lo && v.v <= hi ? mkOk(mkInt(v.v, head)) : mkErr(mkStdErr('TryFromIntError', 'TryFromIntError(())', 'out of range integral type conversion attempted')); });
+      if (last === 'from_str_radix') return ret((a) => parseIntStr(deref(a[0]).v, head, Number(deref(a[1]).v)));
+      if (last === 'default') return ret(() => defaultFor({ tk: 'path', name: head }, n));
+    }
+    if (['String', 'str', 'Vec', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'usize', 'isize', 'f32', 'f64', 'char', 'bool', 'Option', 'Result', 'Iterator', 'HashMap', 'ToString', 'Clone', 'PartialOrd', 'Ord', 'PartialEq'].includes(head)) {
+      if (last === 'default') return ret(() => defaultFor({ tk: 'path', name: head }, n));
+      return ret((a, cn) => {
+        if (!a.length) throw cerr('E0599', 'no function or associated item named `' + last + '` found for `' + head + '`', [span(n)]);
+        const fake = { k: 'mcall', recv: null, name: last, args: [], pos: n.pos, end: n.end, namePos: n.pos, nameEnd: n.end };
+        return callMethodOnValue(a[0], last, a.slice(1), fake, env, ty);
+      });
+    }
+    return null;
+  }
+  function defaultLike(v, n) {
+    switch (v.k) {
+      case 'int': return mkInt(0n, v.ty); case 'float': return mkFloat(0, v.ty); case 'String': return mkString(''); case 'str': return mkStr('');
+      case 'vec': return mkVec([], v.kind); case 'bool': return FALSE; case 'map': return { k: 'map', kind: v.kind, m: new Map() }; case 'set': return { k: 'set', kind: v.kind, m: new Map() };
+      case 'enum': if (v.en === 'Option') return mkNone(); break;
+      case 'struct': return defaultFor({ tk: 'path', name: v.name }, n);
+    }
+    return mkInt(0n, null);
+  }
+  function alignOfTy(t) {
+    t = resolveTy(t);
+    if (t.tk === 'ref') return 8;
+    if (t.tk === 'path') {
+      if (['String', 'Vec', 'Box', 'HashMap', 'Rc', 'Arc', 'usize', 'isize', 'u64', 'i64', 'f64'].includes(t.name)) return 8;
+      if (['u128', 'i128'].includes(t.name)) return 16;
+      if (t.name in SIZE_OF) return SIZE_OF[t.name];
+      const sd = structs.get(t.name); if (sd) return Math.max(1, ...sd.fields.map((f) => alignOfTy(f.ty)));
+    }
+    if (t.tk === 'tuple') return Math.max(1, ...t.elems.map(alignOfTy));
+    return 8;
+  }
+  function sizeOfTy(t) {
+    t = resolveTy(t);
+    if (t.tk === 'ref') { const i = resolveTy(t.inner); return (i.tk === 'slice' || i.tk === 'dyn' || (i.tk === 'path' && i.name === 'str')) ? 16 : 8; }
+    if (t.tk === 'tuple') return t.elems.reduce((s, e) => s + sizeOfTy(e), 0);
+    if (t.tk === 'array') return 0;
+    if (t.tk === 'path') {
+      if (t.name in SIZE_OF) return SIZE_OF[t.name];
+      if (t.name === 'Option' && t.args[0] && (t.args[0].tk === 'ref' || t.args[0].name === 'Box')) return 8;
+      const sd = structs.get(t.name);
+      if (sd) {
+        // rustc reorders fields (largest alignment first) to minimise padding
+        const fs = sd.fields.map((f) => { const s = sizeOfTy(f.ty); return { s, a: alignOfTy(f.ty) }; }).sort((x, y) => y.a - x.a);
+        let sz = 0, al = 1;
+        for (const f of fs) { al = Math.max(al, f.a); sz = Math.ceil(sz / f.a) * f.a + f.s; }
+        return Math.ceil(sz / al) * al;
+      }
+    }
+    return 8;
+  }
+
+  // ---- calls ----
+  function lineCol(pos) {
+    let line = 1, col = 1;
+    for (let i = 0; i < pos && i < src.length; i++) { if (src[i] === '\n') { line++; col = 1; } else col++; }
+    return [line, col];
+  }
+  function bindParam(pat, v, env, n) {
+    if (pat.pk === 'bind' && !pat.sub) {
+      env.vars.set(pat.name, { name: pat.name, val: v, mut: pat.mut, init: true, decl: pat.decl, borrows: null });
+      return;
+    }
+    const binds = [];
+    if (!matchPat(pat, v, tempPlace(v), env, 'move', binds)) throw cerr('E0005', 'refutable pattern in function argument', [span(pat)]);
+    applyBinds(binds, env);
+  }
+  function callFn(decl, args, selfVal, implTy, callNode) {
+    if (!decl.body) throw cerr(null, 'function `' + decl.name + '` has no body', [span(callNode || decl)]);
+    if (args.length !== decl.params.length) {
+      throw cerr('E0061', 'this function takes ' + decl.params.length + ' argument' + (decl.params.length === 1 ? '' : 's') + ' but ' + args.length + ' argument' + (args.length === 1 ? ' was' : 's were') + ' supplied', [callNode ? span(callNode) : span(decl), { pos: decl.namePos, end: decl.nameEnd, text: 'function defined here', primary: false }]);
+    }
+    if (++depth > 1500) { depth = 0; throw new Panic("stack overflow: the call stack ran out of space (infinite recursion?)", callNode ? callNode.pos : decl.pos); }
+    const env = new Env(null);
+    env.selfType = implTy || decl.implTy || null; env.fnDecl = decl;
+    try {
+      if (decl.selfParam) env.vars.set('self', { name: 'self', val: selfVal, mut: decl.selfParam.mut && !decl.selfParam.ref, init: true, decl: decl.selfDecl, borrows: null });
+      for (let i = 0; i < decl.params.length; i++) bindParam(decl.params[i].pat, args[i], env, callNode);
+      let v;
+      try { v = evBlock(decl.body, env, decl.ret, true); }
+      catch (e) { if (e instanceof ReturnSig) v = e.val; else throw e; }
+      checkRet(decl, v);
+      return coerce(v, decl.ret, lastExprNode(decl.body) || decl.body);
+    } finally { depth--; }
+  }
+  function lastExprNode(b) { const s = b.stmts[b.stmts.length - 1]; return s && s.k === 'expr' && !s.semi ? s.expr : null; }
+  function checkRet(decl, v) {
+    const ret = decl.ret ? resolveTy(decl.ret) : null;
+    const unitRet = !ret || (ret.tk === 'tuple' && !ret.elems.length);
+    if (ret && ret.tk === 'never') return;
+    if (!unitRet && v === UNIT) {
+      const last = decl.body.stmts[decl.body.stmts.length - 1];
+      const labels = [{ pos: decl.namePos, end: decl.nameEnd, text: 'implicitly returns `()` as its body has no tail or `return` expression', primary: false }];
+      const notes = [];
+      if (last && last.k === 'expr' && last.semi) { labels.push({ pos: last.expr.end, end: last.expr.end + 1, text: 'help: remove this semicolon to return this value', primary: true }); notes.push('note: in Rust the last expression of a block (without `;`) is its value'); }
+      else labels[0].primary = true;
+      throw cerr('E0308', 'mismatched types: expected `' + tyText(ret) + '`, found `()`', labels, notes);
+    }
+    if (unitRet && v !== UNIT && v.k !== 'tuple' && !(v.k === 'enum' && false)) {
+      const last = lastExprNode(decl.body);
+      if (last) throw cerr('E0308', 'mismatched types', [span(last, 'expected `()`, found ' + foundDesc(v))], ['help: add a `;` after the expression to discard its value, or add `-> ' + typeName(v).replace(/^\{integer\}$/, 'i32').replace(/^\{float\}$/, 'f64') + '` to the function signature']);
+    }
+  }
+  function callValue(f, args, n, ty) {
+    f = derefRefs(f);
+    if (f.k === 'closure') return callClosure(f, args, n);
+    if (f.k === 'fn') {
+      const d = f.decl;
+      if (d.selfParam) {
+        const self = args[0];
+        return callFn(d, args.slice(1).map((a, i) => coerce(a, d.params[i] && d.params[i].ty, n)), d.selfParam.ref ? self : derefRefs(self), f.implTy || d.implTy, n);
+      }
+      return callFn(d, args.map((a, i) => coerce(a, d.params[i] && d.params[i].ty, n && n.args ? n.args[i] : n)), undefined, f.implTy || d.implTy, n);
+    }
+    if (f.k === 'bfn') return f.call(args, n, ty);
+    if (f.k === 'rc') return callValue(f.cell.val, args, n, ty);
+    throw cerr('E0618', 'expected function, found `' + typeName(f) + '`', [span(n && n.f ? n.f : n, 'call expression requires function')]);
+  }
+  function callClosure(f, args, n) {
+    const c = f.node;
+    if (args.length !== c.params.length) throw cerr('E0057', 'this closure takes ' + c.params.length + ' argument' + (c.params.length === 1 ? '' : 's') + ' but ' + args.length + ' ' + (args.length === 1 ? 'argument was' : 'arguments were') + ' supplied', [span(n || c)]);
+    if (++depth > 1500) { depth = 0; throw new Panic('stack overflow', c.pos); }
+    try {
+      const env = new Env(f.env);
+      for (let i = 0; i < c.params.length; i++) bindParam(c.params[i].pat, coerce(args[i], c.params[i].ty, n), env, n);
+      try { return coerce(evMove(c.body, env, c.ret), c.ret, c.body); }
+      catch (e) { if (e instanceof ReturnSig) return e.val; throw e; }
+    } finally { depth--; }
+  }
+  function paramTysOf(f) {
+    f = derefRefs(f);
+    if (f.k === 'fn') return f.decl.params.map((p) => p.ty);
+    if (f.k === 'bfn') return f.paramTys || [];
+    if (f.k === 'closure') return f.node.params.map((p) => p.ty);
+    return [];
+  }
+  function evCall(n, env, ty) {
+    let f;
+    if (n.f.k === 'path') f = evPath(n.f, env, ty, 'borrow');
+    else if (n.f.k === 'field') {
+      // (self.f)(x) style needs parens; obj.field(x) is a method call — handled elsewhere
+      f = ev(n.f, env);
+    } else f = ev(n.f, env);
+    if (f.k === 'typeval') throw cerr('E0423', 'expected function, found builtin type `' + f.name + '`', [span(n.f, 'not a function')], ['help: to convert, use `x as ' + f.name + '` or `' + f.name + '::from(x)`']);
+    const ptys = paramTysOf(f);
+    // drop(x) moves
+    const args = n.args.map((a, i) => evMove(a, env, ptys[i]));
+    if (f.k === 'bfn' && f.name === 'drop' && n.args[0]) {
+      const c = lookupVar(n.args[0], env);
+      if (c && !isCopy(args[0])) dropValue(args[0]);
+    }
+    if (f.k === 'bfn' && f.name === 'mem::drop' && n.args[0]) dropValue(args[0]);
+    return callValue(f, args, n, ty);
+  }
+  function dropValue(v) {
+    if (v.k === 'rc') v.cell.strong--;
+    if (v.k === 'struct') {
+      const m = findTraitMethod(v.name, 'Drop', 'drop');
+      if (m) callFn(m, [], mkRef(tempPlace(v), true), v.name);
+    }
+  }
+
+  // ---- method calls ----
+  function evMethodCall(n, env, ty) {
+    const recvNode = n.recv;
+    const pl = isPlaceExpr(recvNode) ? evPlace(recvNode, env, 'peek') : tempPlace(evMethodRecv(recvNode, env, n));
+    const cell = pl.cell && recvNode.k === 'path' ? pl.cell : null;
+    return methodDispatch(pl, n.name, n, env, ty, recvNode, cell, rootCellOf(recvNode, env));
+  }
+  function evMethodRecv(recvNode, env, n) {
+    // pass type hints for parse()/collect() chains like s.trim().parse::<i32>()
+    return ev(recvNode, env);
+  }
+  function callMethodOnValue(v, name, args, n, env, ty) {
+    const pl = tempPlace(v);
+    return methodDispatch(pl, name, n, env, ty, null, null, null, args);
+  }
+  function methodDispatch(pl, name, n, env, ty, recvNode, cell, root, preArgs) {
+    let v = pl.get();
+    let mutable = pl.mutable, viaRef = pl.viaRef, place = pl, refName = pl.refName || pl.name, rcVia = !!pl.rcVia;
+    const wasRef = v.k === 'ref';
+    // user methods on the ref'd type, auto-deref through refs, Box (transparent) and Rc
+    for (;;) {
+      if (v.k === 'ref') { mutable = v.mut; viaRef = v.mut ? 'mut' : 'shared'; refName = recvNode ? srcOf(recvNode) : 'value'; place = v.place; v = v.place.get(); continue; }
+      if (v.k === 'rc' && !['clone', 'strong_count'].includes(name) && !(name === 'borrow' && false)) {
+        const userRc = null;
+        mutable = false; viaRef = 'shared'; rcVia = true; refName = recvNode ? srcOf(recvNode) : 'value';
+        const c = v.cell; place = { get: () => c.val, set: (x) => { c.val = x; } }; v = c.val; continue;
+      }
+      break;
+    }
+    const recvInfo = { mutable, viaRef, refName, rcVia, root: pl.root, cell: pl.cell };
+    const args = preArgs || null;
+    const key = typeKey(v);
+    const user = (v.k === 'struct' || v.k === 'enum' || PRIM_TYPES.has(key) || v.k === 'vec' || v.k === 'map') ? findMethod(key, name) || (v.k === 'int' && !v.ty ? findIntMethod(name) : null) : null;
+    if (user) {
+      if (!user.selfParam) throw cerr('E0599', 'no method named `' + name + '` found for ' + descType(v) + ' in the current scope', [{ pos: n.namePos, end: n.nameEnd, text: 'this is an associated function, not a method', primary: true }], ['help: use associated function syntax instead: `' + key + '::' + name + '(...)`', 'note: methods take `self`, `&self` or `&mut self` as the first parameter']);
+      let selfVal;
+      if (user.selfParam.ref) {
+        if (user.selfParam.mut) {
+          if (recvNode) requireMut(recvInfo, n, recvNode);
+          if (root && recvNode) checkBorrows(root, { pos: recvNode.pos, end: n.end }, 'mutborrow');
+          selfVal = mkRef(place, true);
+        } else {
+          if (root && recvNode) checkBorrows(root, recvNode, 'borrow');
+          selfVal = mkRef(place, false);
+        }
+      } else {
+        if (!isCopy(v)) {
+          if (viaRef !== 'none' && recvNode) throw cerr('E0507', 'cannot move out of `' + srcOf(recvNode) + '` which is behind a ' + (viaRef === 'mut' ? 'mutable' : 'shared') + ' reference', [span(recvNode, 'move occurs because `' + srcOf(recvNode) + '` has type `' + typeName(v) + '`, which does not implement the `Copy` trait'), { pos: n.namePos, end: n.end, text: '`' + srcOf(recvNode) + '` moved due to this method call', primary: false }], ['help: you can `clone` the value and consume it, but this might not be your desired behavior']);
+          if (cell) { if (root) checkBorrows(root, recvNode, 'move'); markMoved(cell, { pos: n.namePos, end: n.end }, '`' + cell.name + '` moved due to this method call', 'note: `' + key + '::' + name + '` takes ownership of the receiver `self`, which moves `' + cell.name + '`'); }
+          else if (pl.fieldOf && !pl.viaRef !== 'none') markPartial(pl, n);
+          selfVal = v;
+        } else selfVal = copyVal(v);
+      }
+      const as = args || n.args.map((a, i) => evMove(a, env, user.params[i] && user.params[i].ty));
+      return callFn(user, as.map((a, i) => coerce(a, user.params[i] && user.params[i].ty, n.args && n.args[i] ? n.args[i] : n)), selfVal, key, n);
+    }
+    // user Iterator impl: use std adaptors on top of user `next`
+    if (v.k === 'struct' || v.k === 'enum') {
+      const nx = findTraitMethod(key, 'Iterator', 'next');
+      if (nx && name !== 'next') {
+        if (recvNode) requireMut(recvInfo, n, recvNode);
+        const it = userIter(place, nx, key, n);
+        return iterMethod(it, name, n, env, ty, args || evArgsFor(v, name, n, env), { mutable: true, viaRef: 'none' }, recvNode);
+      }
+      if (name === 'clone') {
+        if (!derives(v, 'Clone') && !findTraitMethod(key, 'Clone', 'clone')) throw cerr('E0599', 'no method named `clone` found for ' + descType(v) + ' in the current scope', [{ pos: n.namePos, end: n.nameEnd, text: 'method not found in `' + key + '`', primary: true }], ['help: add `#[derive(Clone)]` to `' + key + '` (and `Copy` too if all its fields are `Copy`)']);
+        return cloneVal(v, n);
+      }
+      if (name === 'to_string') {
+        if (!findTraitMethod(key, 'Display', 'fmt')) throw cerr('E0599', 'the method `to_string` exists for ' + descType(v) + ', but its trait bounds were not satisfied', [{ pos: n.namePos, end: n.nameEnd, text: 'method cannot be called on `' + key + '` due to unsatisfied trait bounds', primary: true }], ['note: `to_string` comes from the `Display` trait. Implement `std::fmt::Display` for `' + key + '` to get it']);
+        return mkString(display(v, n));
+      }
+    }
+    // consuming builtin methods mark moves
+    const kindKey = v.k === 'enum' && (v.en === 'Option' || v.en === 'Result') ? 'enum' : v.k === 'String' ? 'String' : v.k;
+    const mutSet = MUT_METHODS[kindKey];
+    if (mutSet && mutSet.has(name) && !(v.k === 'enum' && !['Option', 'Result'].includes(v.en))) {
+      if (recvNode) requireMut(recvInfo, n, recvNode);
+      if (root && recvNode) checkBorrows(root, { pos: recvNode.pos, end: n.end }, 'mutborrow');
+    } else if (root && recvNode && v.k !== 'iter') checkBorrows(root, recvNode, 'borrow');
+    const consSet = CONSUME_METHODS[kindKey];
+    const consumes = (consSet && consSet.has(name)) || (v.k === 'iter' && !['next', 'peek', 'by_ref', 'size_hint', 'len', 'nth', 'next_back'].includes(name));
+    if (consumes && !isCopy(v) && recvNode && !wasRef) {
+      if (viaRef !== 'none' && v.k !== 'iter') throw cerr('E0507', 'cannot move out of `' + srcOf(recvNode) + '` which is behind a ' + (viaRef === 'mut' ? 'mutable' : 'shared') + ' reference', [span(recvNode, 'move occurs because `' + srcOf(recvNode) + '` has type `' + typeName(v) + '`, which does not implement the `Copy` trait'), { pos: n.namePos, end: n.end, text: '`' + srcOf(recvNode) + '` moved due to this method call', primary: false }], v.k === 'enum' ? ['help: consider calling `.as_ref()` or `.as_mut()` to borrow the type\'s contents'] : []);
+      if (cell) { if (root) checkBorrows(root, recvNode, 'move'); markMoved(cell, { pos: n.namePos, end: n.end }, '`' + cell.name + '` moved due to this method call', 'note: `' + name + '` takes ownership of the receiver `self`, which moves `' + cell.name + '`'); }
+    }
+    const argv = args || evArgsFor(v, name, n, env);
+    return builtinMethod(v, place, name, argv, n, env, ty, recvInfo, recvNode);
+  }
+  function findIntMethod(name) {
+    for (const t of ['i32', 'i64', 'u32', 'u64', 'usize', 'u8']) { const m = findMethod(t, name); if (m) return m; }
+    return null;
+  }
+  function markPartial(pl, n) {
+    const c = pl.fieldOf; if (!c) return;
+    c.partial = c.partial || {}; c.partial[pl.field] = { pos: n.pos, end: n.end };
+  }
+  function descType(v) {
+    if (v.k === 'struct') return 'struct `' + v.name + '`';
+    if (v.k === 'enum') return 'enum `' + typeName(v) + '`';
+    if (v.k === 'vec' || v.k === 'String' || v.k === 'map' || v.k === 'set') return 'struct `' + typeName(v) + '`';
+    if (v.k === 'str') return 'reference `&str`';
+    return 'type `' + typeName(v) + '`';
+  }
+  function evArgsFor(v, name, n, env) {
+    // closures passed to iterator adaptors etc.; move semantics for values
+    return n.args.map((a) => evMove(a, env, null));
+  }
+  function userIter(place, nx, key, n) {
+    const selfRef = mkRef(place, true);
+    return new It(() => { const r = callFn(nx, [], selfRef, key, n); return r.variant === 'Some' ? r.vals[0] : DONE; }, key);
+  }
+  function call1(f, x, n) { return callValue(f, [x], n); }
+  function truthy(v, n) { v = deref(v); if (v.k !== 'bool') throw mismatch('bool', foundDesc(v), n); return v.v; }
+  function argRefVal(a) { return deref(a); }
+
+  // ---- iterator conversion ----
+  function toIter(v, n, mode) {
+    if (v.k === 'iter') return v;
+    if (v.k === 'range') return rangeIter(v, n);
+    if (v.k === 'ref') {
+      const t = v.place.get();
+      const inner = t.k === 'rc' ? t.cell.val : t;
+      if (inner.k === 'vec') return vecIter(inner, v.mut ? 'refmut' : 'ref');
+      if (inner.k === 'map') return mapIter(inner, v.mut ? 'refmut' : 'ref');
+      if (inner.k === 'set') return setIter(inner);
+      if (inner.k === 'enum' && inner.en === 'Option') return itFromArray(inner.variant === 'Some' ? [mkRef({ get: () => inner.vals[0], set: (x) => { inner.vals[0] = x; } }, v.mut)] : []);
+      if (inner.k === 'receiver') return recvIter(inner);
+      if (inner.k === 'iter') return inner;
+      if (inner.k === 'range') return rangeIter(inner, n);
+      if (inner.k === 'struct') { const nx = findTraitMethod(inner.name, 'Iterator', 'next'); if (nx) return userIter(v.place, nx, inner.name, n); }
+      return toIter(inner, n);
+    }
+    if (v.k === 'vec') return vecIter(v, 'move');
+    if (v.k === 'map') return mapIter(v, 'move');
+    if (v.k === 'set') return setIter(v);
+    if (v.k === 'receiver') return recvIter(v);
+    if (v.k === 'enum' && v.en === 'Option') return itFromArray(v.variant === 'Some' ? [v.vals[0]] : []);
+    if (v.k === 'enum' && v.en === 'Result') return itFromArray(v.variant === 'Ok' ? [v.vals[0]] : []);
+    if (v.k === 'struct') { const nx = findTraitMethod(v.name, 'Iterator', 'next'); if (nx) return userIter(tempPlace(v), nx, v.name, n); }
+    if (v.k === 'String' || v.k === 'str') throw cerr('E0277', '`' + typeName(v) + '` is not an iterator', [span(n, '`' + typeName(v) + '` is not an iterator; try calling `.chars()` or `.bytes()`')], ['help: use `.chars()` to iterate over characters']);
+    if (v.k === 'rc') return toIter(v.cell.val, n);
+    throw cerr('E0277', '`' + typeName(v) + '` is not an iterator', [span(n, '`' + typeName(v) + '` is not an iterator')]);
+  }
+  function vecIter(vec, mode) {
+    let i = 0;
+    if (mode === 'move') return new It(() => (i < vec.items.length ? vec.items[i++] : DONE), 'IntoIter');
+    return new It(() => {
+      if (i >= vec.items.length) return DONE;
+      const j = i++;
+      return mkRef({ get: () => vec.items[j], set: (x) => { vec.items[j] = x; if (vec.parent) vec.parent.items[vec.offset + j] = x; } }, mode === 'refmut');
+    }, mode === 'refmut' ? 'IterMut' : 'Iter');
+  }
+  function sortedEntries(map) {
+    const ents = [...map.m.values()];
+    if (map.kind === 'BTreeMap' || map.kind === 'BTreeSet') ents.sort((a, b) => cmpVals(map.k === 'set' ? a : a.k, map.k === 'set' ? b : b.k, null));
+    return ents;
+  }
+  function mapIter(map, mode) {
+    const ents = sortedEntries(map); let i = 0;
+    return new It(() => {
+      if (i >= ents.length) return DONE;
+      const e = ents[i++];
+      if (mode === 'move') return mkTuple([e.k, e.v]);
+      return mkTuple([mkRef(tempPlace(e.k), false), mkRef({ get: () => e.v, set: (x) => { e.v = x; } }, mode === 'refmut')]);
+    }, 'Iter');
+  }
+  function setIter(set) { const ents = sortedEntries(set); let i = 0; return new It(() => (i < ents.length ? ents[i++] : DONE), 'Iter'); }
+  function recvIter(r) { return new It(() => (r.ch.q.length ? r.ch.q.shift() : DONE), 'Iter'); }
+  function rangeIter(r, n) {
+    const lo = r.lo ? deref(r.lo) : null, hi = r.hi ? deref(r.hi) : null;
+    if (!lo) throw cerr('E0277', '`RangeTo` is not an iterator', [span(n)], ['help: give the range a start, for example `0..' + (hi ? hi.v : 'n') + '`']);
+    if (lo.k === 'char') {
+      let c = lo.v.codePointAt(0); const end = hi ? hi.v.codePointAt(0) + (r.incl ? 1 : 0) : 0x110000;
+      return new It(() => (c < end ? mkChar(String.fromCodePoint(c++)) : DONE), 'Range');
+    }
+    if (lo.k !== 'int') throw cerr('E0277', 'the trait bound `' + typeName(lo) + ': Step` is not satisfied', [span(n)], ['note: only integer and char ranges can be iterated']);
+    const ty = lo.ty || (hi && hi.ty) || null;
+    let c = lo.v; const end = hi ? hi.v + (r.incl ? 1n : 0n) : null;
+    return new It(() => {
+      if (end !== null && c >= end) return DONE;
+      const v = mkInt(c, ty); c += 1n; return v;
+    }, 'Range');
+  }
+
+  function collectInto(it, target, n) {
+    target = resolveTy(target);
+    const name = target && target.tk === 'path' ? target.name : 'Vec';
+    if (name === 'String') {
+      let s = ''; let x;
+      while ((x = it.next()) !== DONE) { const d = deref(x); if (d.k === 'char' || d.k === 'str' || d.k === 'String') s += d.v; else throw cerr('E0277', 'a value of type `String` cannot be built from an iterator over elements of type `' + typeName(d) + '`', [span(n)]); }
+      return mkString(s);
+    }
+    if (name === 'HashMap' || name === 'BTreeMap') {
+      const m = new Map(); let x;
+      while ((x = it.next()) !== DONE) { const t = deref(x); if (t.k !== 'tuple' || t.items.length !== 2) throw cerr('E0277', 'a map can only be collected from an iterator of `(key, value)` tuples', [span(n)]); m.set(keyOf(t.items[0], n), { k: t.items[0], v: t.items[1] }); }
+      return coerce({ k: 'map', kind: name, m }, target, n);
+    }
+    if (name === 'HashSet' || name === 'BTreeSet') {
+      const m = new Map(); let x;
+      while ((x = it.next()) !== DONE) m.set(keyOf(x, n), x);
+      return { k: 'set', kind: name, m };
+    }
+    if (name === 'Result' || name === 'Option') {
+      const inner = target.args && target.args[0];
+      const items = []; let x; let failed = null;
+      while ((x = it.next()) !== DONE) {
+        const d = derefRefs(x);
+        if (d.variant === 'Err' || d.variant === 'None') { failed = d; break; }
+        items.push(d.vals[0]);
+      }
+      if (failed) return failed;
+      const col = collectInto(itFromArray(items), inner, n);
+      return name === 'Result' ? mkOk(col) : mkSome(col);
+    }
+    if (name === 'Box') return collectInto(it, target.args && target.args[0], n);
+    const items = []; let x;
+    while ((x = it.next()) !== DONE) { items.push(x); if ((items.length & 1023) === 0) tick(); }
+    const v = mkVec(items, name === 'VecDeque' ? 'VecDeque' : 'Vec');
+    return target && target.tk === 'path' ? coerce(v, target, n) : v;
+  }
+  function numZero(sample, tyName) {
+    if (tyName === 'f64' || tyName === 'f32') return mkFloat(0, tyName);
+    if (INT_BITS[tyName]) return mkInt(0n, tyName);
+    if (sample && sample.k === 'float') return mkFloat(0, sample.ty);
+    return mkInt(0n, sample ? sample.ty : null);
+  }
+  function arith(op, a, b, n) {
+    a = deref(a); b = deref(b);
+    if (a.k === 'int' && b.k === 'int') return intOp(op, a, b, n);
+    if (a.k === 'float' && b.k === 'float') return floatOp(op, a, b, n);
+    return binop(op, a, b, n);
+  }
+
+  // ---- builtin methods ----
+  function builtinMethod(v, place, name, args, n, env, ty, info, recvNode) {
+    const a0 = args[0], a1 = args[1];
+    const nargs = (k) => { if (args.length !== k) throw cerr('E0061', 'this method takes ' + k + ' argument' + (k === 1 ? '' : 's') + ' but ' + args.length + ' argument' + (args.length === 1 ? ' was' : 's were') + ' supplied', [span(n)]); };
+    switch (v.k) {
+      case 'int': {
+        const t = v.ty;
+        const other = () => { const o = deref(a0); if (o.k !== 'int') throw mismatch(t || 'i32', foundDesc(o), n.args[0] || n); if (t && o.ty && o.ty !== t) throw mismatch(t, '`' + o.ty + '`', n.args[0] || n); return o; };
+        const effTy = () => t || (a0 && deref(a0).ty) || null;
+        const inRange = (r, tt) => { const [lo, hi] = intRange(tt || 'i32'); return r >= lo && r <= hi; };
+        const opMap = { add: (x, y) => x + y, sub: (x, y) => x - y, mul: (x, y) => x * y, div: (x, y) => x / y, rem: (x, y) => x % y, pow: (x, y) => x ** y };
+        let m;
+        if ((m = /^(checked|wrapping|saturating|overflowing)_(add|sub|mul|div|rem|pow)$/.exec(name))) {
+          const o = m[2] === 'pow' ? deref(a0) : other(); const tt = effTy() || 'i32';
+          if ((m[2] === 'div' || m[2] === 'rem') && o.v === 0n) { if (m[1] === 'checked') return mkNone(); panic('attempt to divide by zero', n); }
+          const r = opMap[m[2]](v.v, o.v);
+          const ok = inRange(r, tt);
+          if (m[1] === 'checked') return ok ? mkSome(mkInt(r, t)) : mkNone();
+          if (m[1] === 'wrapping') return mkInt(wrapInt(r, tt), t);
+          if (m[1] === 'overflowing') return mkTuple([mkInt(wrapInt(r, tt), t), mkBool(!ok)]);
+          const [lo, hi] = intRange(tt); return mkInt(r < lo ? lo : r > hi ? hi : r, t);
+        }
+        switch (name) {
+          case 'abs': { const r = v.v < 0n ? -v.v : v.v; if (t && !inRange(r, t)) panic('attempt to negate with overflow', n); return mkInt(r, t); }
+          case 'pow': { const e = deref(a0); const r = v.v ** e.v; if (!inRange(r, t || 'i32') && (t || !inRange(r, 'i64'))) panic('attempt to multiply with overflow', n); return mkInt(r, t); }
+          case 'min': { const o = other(); return v.v <= o.v ? mkInt(v.v, t || o.ty) : o; }
+          case 'max': { const o = other(); return v.v >= o.v ? mkInt(v.v, t || o.ty) : o; }
+          case 'clamp': { const lo = deref(a0), hi = deref(a1); return mkInt(v.v < lo.v ? lo.v : v.v > hi.v ? hi.v : v.v, t || lo.ty); }
+          case 'signum': return mkInt(v.v > 0n ? 1n : v.v < 0n ? -1n : 0n, t);
+          case 'is_positive': return mkBool(v.v > 0n);
+          case 'is_negative': return mkBool(v.v < 0n);
+          case 'rem_euclid': { const o = other(); if (o.v === 0n) panic('attempt to calculate the remainder with a divisor of zero', n); let r = v.v % o.v; if (r < 0n) r += o.v < 0n ? -o.v : o.v; return mkInt(r, t || o.ty); }
+          case 'div_euclid': { const o = other(); let q = v.v / o.v; if (v.v % o.v < 0n) q = o.v > 0n ? q - 1n : q + 1n; return mkInt(q, t || o.ty); }
+          case 'abs_diff': { const o = other(); const d = v.v > o.v ? v.v - o.v : o.v - v.v; return mkInt(d, t && t[0] === 'i' ? 'u' + t.slice(1) : t); }
+          case 'count_ones': return mkInt(BigInt([...BigInt.asUintN(INT_BITS[t || 'i32'], v.v).toString(2)].filter((c) => c === '1').length), 'u32');
+          case 'count_zeros': { const bits = INT_BITS[t || 'i32']; return mkInt(BigInt(bits - [...BigInt.asUintN(bits, v.v).toString(2)].filter((c) => c === '1').length), 'u32'); }
+          case 'leading_zeros': { const bits = INT_BITS[t || 'i32']; const s = BigInt.asUintN(bits, v.v).toString(2); return mkInt(BigInt(v.v === 0n ? bits : bits - s.length), 'u32'); }
+          case 'trailing_zeros': { const bits = INT_BITS[t || 'i32']; if (v.v === 0n) return mkInt(BigInt(bits), 'u32'); const s = BigInt.asUintN(bits, v.v).toString(2); return mkInt(BigInt(s.length - 1 - s.lastIndexOf('1')), 'u32'); }
+          case 'is_power_of_two': return mkBool(v.v > 0n && (v.v & (v.v - 1n)) === 0n);
+          case 'next_power_of_two': { let p = 1n; while (p < v.v) p <<= 1n; return mkInt(p, t); }
+          case 'isqrt': { let x = BigInt(Math.floor(Math.sqrt(Number(v.v)))); while (x * x > v.v) x--; while ((x + 1n) * (x + 1n) <= v.v) x++; return mkInt(x, t); }
+          case 'to_string': return mkString(v.v.toString());
+          case 'cmp': return mkOrd(cmpVals(v, a0, n, true));
+          case 'partial_cmp': return mkSome(mkOrd(cmpVals(v, a0, n)));
+          case 'eq': return mkBool(valEq(v, a0, n)); case 'ne': return mkBool(!valEq(v, a0, n));
+          case 'lt': return mkBool(cmpVals(v, a0, n) < 0); case 'le': return mkBool(cmpVals(v, a0, n) <= 0); case 'gt': return mkBool(cmpVals(v, a0, n) > 0); case 'ge': return mkBool(cmpVals(v, a0, n) >= 0);
+          case 'clone': case 'to_owned': return v;
+          case 'into': return coerceInto(v, ty, n);
+          case 'sqrt': case 'powf': case 'powi': case 'floor': throw cerr('E0599', 'no method named `' + name + '` found for type `' + (t || '{integer}') + '` in the current scope', [{ pos: n.namePos, end: n.nameEnd, text: 'method not found', primary: true }], ['help: `' + name + '` is a float method. Convert first: `(x as f64).' + name + '(...)`']);
+          case 'to_le_bytes': case 'to_be_bytes': { const bits = INT_BITS[t || 'i32'] / 8; let x = BigInt.asUintN(bits * 8, v.v); const bs = []; for (let i = 0; i < bits; i++) { bs.push(mkInt(x & 255n, 'u8')); x >>= 8n; } if (name === 'to_be_bytes') bs.reverse(); return mkVec(bs, 'array'); }
+          case 'hash': return UNIT;
+        }
+        break;
+      }
+      case 'float': {
+        const t = v.ty; const f = (x) => mkFloat(x, t);
+        const num = (a) => { const d = deref(a); if (d.k === 'int' && name !== 'powi') throw mismatch(t || 'f64', foundDesc(d), n.args[0] || n); return d.k === 'int' ? Number(d.v) : d.v; };
+        switch (name) {
+          case 'sqrt': return f(Math.sqrt(v.v)); case 'cbrt': return f(Math.cbrt(v.v));
+          case 'powi': return f(Math.pow(v.v, Number(deref(a0).v)));
+          case 'powf': return f(Math.pow(v.v, num(a0)));
+          case 'abs': return f(Math.abs(v.v)); case 'floor': return f(Math.floor(v.v)); case 'ceil': return f(Math.ceil(v.v));
+          case 'round': return f(v.v < 0 ? -Math.round(-v.v) : Math.round(v.v)); case 'trunc': return f(Math.trunc(v.v)); case 'fract': return f(v.v - Math.trunc(v.v));
+          case 'sin': return f(Math.sin(v.v)); case 'cos': return f(Math.cos(v.v)); case 'tan': return f(Math.tan(v.v));
+          case 'asin': return f(Math.asin(v.v)); case 'acos': return f(Math.acos(v.v)); case 'atan': return f(Math.atan(v.v)); case 'atan2': return f(Math.atan2(v.v, num(a0)));
+          case 'exp': return f(Math.exp(v.v)); case 'ln': return f(Math.log(v.v)); case 'log10': return f(Math.log10(v.v)); case 'log2': return f(Math.log2(v.v)); case 'log': return f(Math.log(v.v) / Math.log(num(a0)));
+          case 'max': return f(Math.max(v.v, num(a0))); case 'min': return f(Math.min(v.v, num(a0)));
+          case 'clamp': return f(Math.min(Math.max(v.v, num(a0)), num(a1)));
+          case 'hypot': return f(Math.hypot(v.v, num(a0))); case 'mul_add': return f(v.v * num(a0) + num(a1));
+          case 'is_nan': return mkBool(Number.isNaN(v.v)); case 'is_finite': return mkBool(Number.isFinite(v.v)); case 'is_infinite': return mkBool(Math.abs(v.v) === Infinity);
+          case 'is_sign_negative': return mkBool(v.v < 0 || Object.is(v.v, -0)); case 'is_sign_positive': return mkBool(!(v.v < 0 || Object.is(v.v, -0)));
+          case 'signum': return f(Number.isNaN(v.v) ? NaN : (v.v < 0 || Object.is(v.v, -0)) ? -1 : 1);
+          case 'to_degrees': return f(v.v * 180 / Math.PI); case 'to_radians': return f(v.v * Math.PI / 180); case 'recip': return f(1 / v.v);
+          case 'to_string': return mkString(floatDisplay(v.v, t, null));
+          case 'partial_cmp': { const c = cmpVals(v, a0, n); return Number.isNaN(c) ? mkNone() : mkSome(mkOrd(c)); }
+          case 'total_cmp': { const o = deref(a0).v; return mkOrd(v.v < o ? -1 : v.v > o ? 1 : 0); }
+          case 'cmp': cmpVals(v, a0, n, true); break;
+          case 'eq': return mkBool(valEq(v, a0, n));
+          case 'clone': return v;
+          case 'into': return coerceInto(v, ty, n);
+          case 'to_bits': { const b = new DataView(new ArrayBuffer(8)); b.setFloat64(0, v.v); return mkInt(b.getBigUint64(0), 'u64'); }
+        }
+        break;
+      }
+      case 'bool':
+        if (name === 'then') return v.v ? mkSome(callValue(a0, [], n)) : mkNone();
+        if (name === 'then_some') return v.v ? mkSome(a0) : mkNone();
+        if (name === 'to_string') return mkString(String(v.v));
+        if (name === 'clone') return v;
+        if (name === 'cmp') return mkOrd(cmpVals(v, a0, n));
+        if (name === 'eq') return mkBool(valEq(v, a0, n));
+        break;
+      case 'char': {
+        const c = v.v; const cp = c.codePointAt(0);
+        switch (name) {
+          case 'is_alphabetic': return mkBool(/\p{Alphabetic}/u.test(c));
+          case 'is_numeric': return mkBool(/\p{N}/u.test(c));
+          case 'is_alphanumeric': return mkBool(/[\p{Alphabetic}\p{N}]/u.test(c));
+          case 'is_whitespace': return mkBool(/\s/u.test(c));
+          case 'is_uppercase': return mkBool(/\p{Uppercase}/u.test(c));
+          case 'is_lowercase': return mkBool(/\p{Lowercase}/u.test(c));
+          case 'is_control': return mkBool(/\p{Cc}/u.test(c));
+          case 'is_ascii': return mkBool(cp < 128);
+          case 'is_ascii_digit': return mkBool(/[0-9]/.test(c) && cp < 128);
+          case 'is_ascii_alphabetic': return mkBool(/[A-Za-z]/.test(c) && cp < 128);
+          case 'is_ascii_alphanumeric': return mkBool(/[A-Za-z0-9]/.test(c) && cp < 128);
+          case 'is_ascii_uppercase': return mkBool(/[A-Z]/.test(c) && cp < 128);
+          case 'is_ascii_lowercase': return mkBool(/[a-z]/.test(c) && cp < 128);
+          case 'is_ascii_punctuation': return mkBool(cp < 128 && /[!-\/:-@\[-`{-~]/.test(c));
+          case 'is_ascii_whitespace': return mkBool(' \t\n\r\x0c'.includes(c));
+          case 'is_ascii_hexdigit': return mkBool(/[0-9a-fA-F]/.test(c) && cp < 128);
+          case 'is_digit': { const r = Number(deref(a0).v); const d = parseInt(c, r); return mkBool(!Number.isNaN(d) && cp < 128); }
+          case 'to_digit': { const r = Number(deref(a0).v); const d = parseInt(c, r); return !Number.isNaN(d) && cp < 128 ? mkSome(mkInt(BigInt(d), 'u32')) : mkNone(); }
+          case 'to_ascii_uppercase': return mkChar(cp < 128 ? c.toUpperCase() : c);
+          case 'to_ascii_lowercase': return mkChar(cp < 128 ? c.toLowerCase() : c);
+          case 'to_uppercase': return itFromArray(Array.from(c.toUpperCase()).map(mkChar), 'CaseMapping');
+          case 'to_lowercase': return itFromArray(Array.from(c.toLowerCase()).map(mkChar), 'CaseMapping');
+          case 'len_utf8': return usize(charUtf8Len(c));
+          case 'to_string': return mkString(c);
+          case 'eq_ignore_ascii_case': return mkBool(c.toLowerCase() === deref(a0).v.toLowerCase());
+          case 'cmp': return mkOrd(cmpVals(v, a0, n));
+          case 'clone': return v;
+          case 'into': return coerceInto(v, ty, n);
+          case 'eq': return mkBool(valEq(v, a0, n));
+        }
+        break;
+      }
+      case 'str': case 'String': {
+        const r = strMethod(v, place, name, args, n, env, ty, info);
+        if (r !== null) return r;
+        break;
+      }
+      case 'vec': { const r = vecMethod(v, place, name, args, n, env, ty, info); if (r !== null) return r; break; }
+      case 'map': { const r = mapMethod(v, name, args, n, env, ty); if (r !== null) return r; break; }
+      case 'set': { const r = setMethod(v, name, args, n, env, ty); if (r !== null) return r; break; }
+      case 'enum': {
+        if (v.en === 'Option' || v.en === 'Result') { const r = optMethod(v, place, name, args, n, env, ty); if (r !== null) return r; }
+        if (v.en === 'Ordering') {
+          switch (name) {
+            case 'reverse': return mkOrd(1 - variantIndex(v) === 0 ? 0 : -(variantIndex(v) - 1));
+            case 'then': return v.variant === 'Equal' ? a0 : v;
+            case 'then_with': return v.variant === 'Equal' ? callValue(a0, [], n) : v;
+            case 'is_lt': return mkBool(v.variant === 'Less'); case 'is_gt': return mkBool(v.variant === 'Greater'); case 'is_eq': return mkBool(v.variant === 'Equal');
+            case 'is_le': return mkBool(v.variant !== 'Greater'); case 'is_ge': return mkBool(v.variant !== 'Less'); case 'is_ne': return mkBool(v.variant !== 'Equal');
+          }
+        }
+        break;
+      }
+      case 'iter': return iterMethod(v, name, n, env, ty, args, info, recvNode);
+      case 'range': {
+        if (name === 'contains') { const x = deref(a0); const lo = v.lo ? cmpVals(x, v.lo, n) >= 0 : true; const hi = v.hi ? (v.incl ? cmpVals(x, v.hi, n) <= 0 : cmpVals(x, v.hi, n) < 0) : true; return mkBool(lo && hi); }
+        if (name === 'len') { const lo = deref(v.lo).v, hi = deref(v.hi).v + (v.incl ? 1n : 0n); return usize(hi > lo ? hi - lo : 0n); }
+        if (name === 'is_empty') { const lo = deref(v.lo).v, hi = deref(v.hi).v + (v.incl ? 1n : 0n); return mkBool(hi <= lo); }
+        if (name === 'start') return v.lo; if (name === 'end') return v.hi;
+        return iterMethod(rangeIter(v, n), name, n, env, ty, args, info, recvNode);
+      }
+      case 'tuple':
+        if (name === 'clone') return cloneVal(v, n);
+        if (name === 'cmp') return mkOrd(cmpVals(v, a0, n));
+        if (name === 'eq') return mkBool(valEq(v, a0, n));
+        break;
+      case 'rc':
+        if (name === 'clone') return cloneVal(v, n);
+        break;
+      case 'cell': {
+        const c = v;
+        switch (name) {
+          case 'borrow': case 'read': return mkRef({ get: () => c.place.val, set: (x) => { c.place.val = x; } }, false);
+          case 'borrow_mut': case 'write': return mkRef({ get: () => c.place.val, set: (x) => { c.place.val = x; } }, true);
+          case 'lock': return mkOk(mkRef({ get: () => c.place.val, set: (x) => { c.place.val = x; } }, true));
+          case 'try_lock': return mkOk(mkRef({ get: () => c.place.val, set: (x) => { c.place.val = x; } }, true));
+          case 'get': return c.place.val;
+          case 'set': c.place.val = a0; return UNIT;
+          case 'replace': { const old = c.place.val; c.place.val = a0; return old; }
+          case 'take': { const old = c.place.val; c.place.val = defaultLike(old, n); return old; }
+          case 'into_inner': return c.kind === 'Mutex' ? mkOk(c.place.val) : c.place.val;
+          case 'get_mut': return c.kind === 'Mutex' ? mkOk(mkRef({ get: () => c.place.val, set: (x) => { c.place.val = x; } }, true)) : mkRef({ get: () => c.place.val, set: (x) => { c.place.val = x; } }, true);
+          case 'fetch_add': { const old = c.place.val; c.place.val = mkInt(old.v + deref(a0).v, old.ty); return old; }
+          case 'fetch_sub': { const old = c.place.val; c.place.val = mkInt(old.v - deref(a0).v, old.ty); return old; }
+          case 'load': return c.place.val;
+          case 'store': c.place.val = a0; return UNIT;
+          case 'clone': return cloneVal(v, n);
+        }
+        break;
+      }
+      case 'handle':
+        if (name === 'join') { if (v.panicked) return mkErr(mkStdErr('Any', 'Any { .. }', 'thread panicked')); return mkOk(v.result === undefined ? UNIT : v.result); }
+        if (name === 'is_finished') return TRUE;
+        break;
+      case 'sender':
+        if (name === 'send') { v.ch.q.push(a0); return mkOk(UNIT); }
+        if (name === 'clone') return { k: 'sender', ch: v.ch };
+        break;
+      case 'receiver':
+        if (name === 'recv') return v.ch.q.length ? mkOk(v.ch.q.shift()) : mkErr(mkStdErr('RecvError', 'RecvError', 'receiving on a closed channel'));
+        if (name === 'try_recv' || name === 'recv_timeout') return v.ch.q.length ? mkOk(v.ch.q.shift()) : mkErr(mkStdErr('TryRecvError', 'Disconnected', 'receiving on a closed channel'));
+        if (name === 'iter' || name === 'try_iter' || name === 'into_iter') return recvIter(v);
+        break;
+      case 'duration': {
+        switch (name) {
+          case 'as_secs': return mkInt(BigInt(Math.floor(v.ns / 1e9)), 'u64');
+          case 'as_millis': return mkInt(BigInt(Math.floor(v.ns / 1e6)), 'u128');
+          case 'as_micros': return mkInt(BigInt(Math.floor(v.ns / 1e3)), 'u128');
+          case 'as_nanos': return mkInt(BigInt(Math.floor(v.ns)), 'u128');
+          case 'as_secs_f64': return mkFloat(v.ns / 1e9, 'f64');
+          case 'as_secs_f32': return mkFloat(v.ns / 1e9, 'f32');
+          case 'subsec_millis': return mkInt(BigInt(Math.floor((v.ns % 1e9) / 1e6)), 'u32');
+          case 'subsec_nanos': return mkInt(BigInt(Math.floor(v.ns % 1e9)), 'u32');
+          case 'clone': return v;
+        }
+        break;
+      }
+      case 'instant':
+        if (name === 'elapsed') return { k: 'duration', ns: Math.max(0, (now() - v.t) * 1e6) };
+        if (name === 'duration_since') return { k: 'duration', ns: Math.max(0, (v.t - deref(a0).t) * 1e6) };
+        if (name === 'clone') return v;
+        break;
+      case 'stdin':
+        if (name === 'read_line') {
+          const target = a0; const line = stdinPos < stdinLines.length ? stdinLines[stdinPos++] : null;
+          if (line === null || (stdinPos === stdinLines.length && line === '')) return mkOk(usize(0));
+          const s = line + '\n'; const tv = derefRefs(target);
+          tv.v += s; return mkOk(usize(utf8Len(s)));
+        }
+        if (name === 'lines') return new It(() => { if (stdinPos >= stdinLines.length) return DONE; const l = stdinLines[stdinPos++]; if (stdinPos === stdinLines.length && l === '') return DONE; return mkOk(mkString(l)); }, 'Lines');
+        if (name === 'lock') return v;
+        break;
+      case 'stdout':
+        if (name === 'flush') return mkOk(UNIT);
+        if (name === 'lock') return v;
+        break;
+      case 'fmt': {
+        if (name === 'write_str') { v.buf.push(deref(a0).v); return mkOk(UNIT); }
+        if (name === 'pad') { v.buf.push(deref(a0).v); return mkOk(UNIT); }
+        if (name === 'write_fmt') { v.buf.push(deref(a0).v); return mkOk(UNIT); }
+        if (name === 'alternate') return FALSE;
+        if (name === 'debug_struct') { const b = { k: 'dbgb', f: v, name: deref(a0).v, fields: [] }; return b; }
+        break;
+      }
+      case 'dbgb':
+        if (name === 'field') { v.fields.push([deref(a0).v, a1]); return v; }
+        if (name === 'finish') { v.f.buf.push(v.fields.length ? v.name + ' { ' + v.fields.map(([k, x]) => k + ': ' + debug(x, false, '', n)).join(', ') + ' }' : v.name); return mkOk(UNIT); }
+        break;
+      case 'stderr':
+        if (name === 'to_string') return mkString(v.display);
+        if (name === 'kind') return { k: 'stderr', name: 'IntErrorKind', debug: v.debug.replace(/^.*kind: (\w+).*$/, '$1'), display: v.display };
+        if (name === 'clone') return v;
+        break;
+      case 'struct':
+        if (name === 'eq') return mkBool(valEq(v, a0, n));
+        if (name === 'ne') return mkBool(!valEq(v, a0, n));
+        if (name === 'cmp' || name === 'partial_cmp') { const c = mkOrd(cmpVals(v, a0, n)); return name === 'cmp' ? c : mkSome(c); }
+        if (name === 'into') return coerceInto(v, ty, n);
+        if (name === 'hash') return UNIT;
+        break;
+      case 'closure': case 'fn': case 'bfn':
+        if (name === 'clone') return v;
+        break;
+    }
+    // generic fallbacks
+    if (name === 'clone' || name === 'to_owned') return cloneVal(v, n);
+    if (name === 'to_string') return mkString(display(v, n));
+    if (name === 'eq') return mkBool(valEq(v, a0, n));
+    if (name === 'ne') return mkBool(!valEq(v, a0, n));
+    if (name === 'cmp') return mkOrd(cmpVals(v, a0, n, true));
+    if (name === 'partial_cmp') return mkSome(mkOrd(cmpVals(v, a0, n)));
+    if (name === 'as_ref' || name === 'borrow' || name === 'as_mut' || name === 'deref' || name === 'by_ref') return mkRef(place, name === 'as_mut');
+    if (name === 'into') return coerceInto(v, ty, n);
+    if (name === 'iter' || name === 'into_iter') return toIter(v, n);
+    const hint = name === 'len' && v.k === 'iter' ? ['help: iterators have no `len()` here; use `.count()` (it consumes the iterator)'] : [];
+    throw cerr('E0599', 'no method named `' + name + '` found for ' + descType(v) + ' in the current scope', [{ pos: n.namePos, end: n.nameEnd, text: 'method not found in `' + typeName(v) + '`', primary: true }], hint.concat(['note: if this is valid Rust, the teaching interpreter may not support it yet. Try the Rust Playground button.']));
+  }
+  function coerceInto(v, ty, n) {
+    ty = resolveTy(ty);
+    if (!ty || ty.tk !== 'path') return v;
+    const nm = ty.name;
+    if (nm === 'String' && (v.k === 'str' || v.k === 'char')) return mkString(v.v);
+    if (nm === 'String' && v.k === 'String') return v;
+    if (INT_BITS[nm] && v.k === 'int') return mkInt(v.v, nm);
+    if (INT_BITS[nm] && v.k === 'char') return mkInt(BigInt(v.v.codePointAt(0)), nm);
+    if ((nm === 'f64' || nm === 'f32') && v.k === 'int') return mkFloat(Number(v.v), nm);
+    if ((nm === 'f64' || nm === 'f32') && v.k === 'float') return mkFloat(v.v, nm);
+    if (nm === 'Box' || nm === 'Option' && false) return v;
+    if ((nm === 'Vec') && (v.k === 'str' || v.k === 'String')) return mkVec(Array.from(new TextEncoder().encode(v.v)).map((b) => mkInt(BigInt(b), 'u8')));
+    const userFrom = impls.get(nm) && impls.get(nm).traitImpls.find((t) => t.trait === 'From' && (!t.arg || t.arg === typeKey(v) || (t.arg === 'str' && v.k === 'str')));
+    if (userFrom) return callFn(userFrom.methods.get('from'), [v], undefined, nm, n);
+    return v;
+  }
+  function parseIntStr(s, tyName, radix) {
+    const mkE = (kind, msg) => mkErr(mkStdErr('ParseIntError', 'ParseIntError { kind: ' + kind + ' }', msg));
+    if (s.length === 0) return mkE('Empty', 'cannot parse integer from empty string');
+    let str = s; let neg = false;
+    if (str[0] === '+' || str[0] === '-') { neg = str[0] === '-'; str = str.slice(1); if (!str.length) return mkE('InvalidDigit', 'invalid digit found in string'); }
+    if (neg && tyName && tyName[0] === 'u') return mkE('InvalidDigit', 'invalid digit found in string');
+    const digits = '0123456789abcdefghijklmnopqrstuvwxyz'.slice(0, radix || 10);
+    let val = 0n; const R = BigInt(radix || 10);
+    for (const ch of str.toLowerCase()) { const d = digits.indexOf(ch); if (d < 0) return mkE('InvalidDigit', 'invalid digit found in string'); val = val * R + BigInt(d); }
+    if (neg) val = -val;
+    const t = tyName || 'i32';
+    const [lo, hi] = intRange(t);
+    if (val > hi) return mkE('PosOverflow', 'number too large to fit in target type');
+    if (val < lo) return mkE('NegOverflow', 'number too small to fit in target type');
+    return mkOk(mkInt(val, tyName || null));
+  }
+  function parseStr(s, target, n) {
+    target = resolveTy(target);
+    let tn = target && target.tk === 'path' ? target.name : null;
+    if (tn === 'Result' || tn === 'Option') { const a = target.args && target.args[0]; tn = a && a.tk === 'path' ? a.name : null; }
+    if (tn && INT_BITS[tn]) return parseIntStr(s, tn, 10);
+    if (tn === 'f64' || tn === 'f32') {
+      const t = s.trim() === s ? s : 'x';
+      if (/^[+-]?(\d+\.?\d*([eE][+-]?\d+)?|\.\d+([eE][+-]?\d+)?|inf|infinity|nan)$/i.test(t)) { const lower = t.toLowerCase(); const v = lower.includes('inf') ? (lower[0] === '-' ? -Infinity : Infinity) : lower.includes('nan') ? NaN : parseFloat(t); return mkOk(mkFloat(v, tn)); }
+      return mkErr(mkStdErr('ParseFloatError', 'ParseFloatError { kind: ' + (s.length ? 'Invalid' : 'Empty') + ' }', s.length ? 'invalid float literal' : 'cannot parse float from empty string'));
+    }
+    if (tn === 'bool') return s === 'true' ? mkOk(TRUE) : s === 'false' ? mkOk(FALSE) : mkErr(mkStdErr('ParseBoolError', 'ParseBoolError', 'provided string was not `true` or `false`'));
+    if (tn === 'char') { const cs = Array.from(s); return cs.length === 1 ? mkOk(mkChar(cs[0])) : mkErr(mkStdErr('ParseCharError', 'ParseCharError { kind: ' + (cs.length ? 'TooManyChars' : 'EmptyString') + ' }', cs.length ? 'too many characters in string' : 'cannot parse char from empty string')); }
+    if (tn === 'String') return mkOk(mkString(s));
+    if (tn && (structs.has(tn) || enums.has(tn))) {
+      const fs = findTraitMethod(tn, 'FromStr', 'from_str');
+      if (fs) return callFn(fs, [mkStr(s)], undefined, tn, n);
+    }
+    // no type info: guess
+    if (/^[+-]?\d+$/.test(s)) return parseIntStr(s, null, 10);
+    if (/^[+-]?(\d+\.\d*|\.\d+)([eE][+-]?\d+)?$/.test(s)) return mkOk(mkFloat(parseFloat(s), null));
+    return parseIntStr(s, null, 10);
+  }
+  function pattern(a, n) {
+    // returns predicate over a char string (single char) or substring matcher
+    const p = derefRefs(a);
+    if (p.k === 'char') return { kind: 'str', s: p.v };
+    if (p.k === 'str' || p.k === 'String') return { kind: 'str', s: p.v };
+    if (p.k === 'closure' || p.k === 'fn' || p.k === 'bfn') return { kind: 'fn', f: (ch) => truthy(callValue(p, [mkChar(ch)], n), n) };
+    if (p.k === 'vec') { const set = p.items.map((x) => deref(x).v); return { kind: 'fn', f: (ch) => set.includes(ch) }; }
+    throw cerr('E0277', 'expected a `char`, `&str` or closure pattern', [span(n)]);
+  }
+  function findPat(s, pat, from) {
+    if (pat.kind === 'str') { const i = s.indexOf(pat.s, from || 0); return i < 0 ? null : [i, i + pat.s.length]; }
+    let i = from || 0;
+    for (const ch of s.slice(i)) { if (pat.f(ch)) return [i, i + ch.length]; i += ch.length; }
+    return null;
+  }
+  function splitBy(s, pat) {
+    const parts = []; let start = 0;
+    if (pat.kind === 'str' && pat.s === '') { return [''].concat(Array.from(s)).concat(['']); }
+    for (;;) { const m = findPat(s, pat, start); if (!m) break; parts.push(s.slice(start, m[0])); start = m[1]; }
+    parts.push(s.slice(start));
+    return parts;
+  }
+  function strMethod(v, place, name, args, n, env, ty, info) {
+    const s = v.v; const a0 = args[0], a1 = args[1];
+    const own = v.k === 'String';
+    const sv = (x) => mkStr(x);
+    const req = () => { if (!own) throw cerr('E0599', 'no method named `' + name + '` found for reference `&str` in the current scope', [{ pos: n.namePos, end: n.nameEnd, text: 'method not found in `&str`', primary: true }], ['help: `' + name + '` needs an owned, growable `String`. Create one with `.to_string()` or `String::from(...)`']); };
+    switch (name) {
+      case 'len': return usize(utf8Len(s));
+      case 'is_empty': return mkBool(s.length === 0);
+      case 'push': { req(); const c = deref(a0); if (c.k !== 'char') throw mismatch('char', foundDesc(c), n.args[0] || n, c.k === 'str' ? 'help: to add a string use `push_str`, or use single quotes for a char: \'' + c.v + '\'' : null); v.v += c.v; return UNIT; }
+      case 'push_str': { req(); const c = deref(a0); if (a0.k === 'String') throw mismatch('&str', '`String`', n.args[0] || n, 'help: consider borrowing here: `&' + srcOf(n.args[0]) + '`'); if (c.k !== 'str' && c.k !== 'String') throw mismatch('&str', foundDesc(c), n.args[0] || n); v.v += c.v; return UNIT; }
+      case 'pop': { req(); if (!s.length) return mkNone(); const cs = Array.from(s); const c = cs.pop(); v.v = cs.join(''); return mkSome(mkChar(c)); }
+      case 'insert': { req(); const i = byteToIdx(s, Number(deref(a0).v)); v.v = s.slice(0, i) + deref(a1).v + s.slice(i); return UNIT; }
+      case 'insert_str': { req(); const i = byteToIdx(s, Number(deref(a0).v)); v.v = s.slice(0, i) + deref(a1).v + s.slice(i); return UNIT; }
+      case 'remove': { req(); const i = byteToIdx(s, Number(deref(a0).v)); if (i < 0 || i >= s.length) panic('cannot remove a char from the end of a string', n); const c = String.fromCodePoint(s.codePointAt(i)); v.v = s.slice(0, i) + s.slice(i + c.length); return mkChar(c); }
+      case 'truncate': { req(); const i = byteToIdx(s, Number(deref(a0).v)); if (i >= 0) v.v = s.slice(0, i); return UNIT; }
+      case 'clear': req(); v.v = ''; return UNIT;
+      case 'retain': { req(); v.v = Array.from(s).filter((c) => truthy(callValue(a0, [mkChar(c)], n), n)).join(''); return UNIT; }
+      case 'capacity': return usize(utf8Len(s));
+      case 'as_str': case 'as_ref': case 'borrow': case 'trim_matches_none': return sv(s);
+      case 'to_string': case 'to_owned': case 'clone': return name === 'clone' && !own ? v : mkString(s);
+      case 'into': { const r = coerceInto(v, ty, n); return r === v && !own && ty && ty.name === 'String' ? mkString(s) : r; }
+      case 'as_bytes': case 'into_bytes': case 'to_vec': return mkVec(Array.from(new TextEncoder().encode(s)).map((b) => mkInt(BigInt(b), 'u8')), name === 'as_bytes' ? 'slice' : 'Vec');
+      case 'bytes': return itFromArray(Array.from(new TextEncoder().encode(s)).map((b) => mkInt(BigInt(b), 'u8')), 'Bytes');
+      case 'chars': return itFromArray(Array.from(s).map(mkChar), 'Chars');
+      case 'char_indices': { let b = 0; const arr = Array.from(s).map((c) => { const t = mkTuple([usize(b), mkChar(c)]); b += charUtf8Len(c); return t; }); return itFromArray(arr, 'CharIndices'); }
+      case 'lines': return itFromArray(s.split('\n').map((l) => l.replace(/\r$/, '')).filter((l, i, arr) => !(i === arr.length - 1 && l === '')).map(sv), 'Lines');
+      case 'split_whitespace': case 'split_ascii_whitespace': return itFromArray(s.split(/\s+/).filter((x) => x.length).map(sv), 'SplitWhitespace');
+      case 'split': return itFromArray(splitBy(s, pattern(a0, n)).map(sv), 'Split');
+      case 'rsplit': return itFromArray(splitBy(s, pattern(a0, n)).reverse().map(sv), 'RSplit');
+      case 'split_terminator': { const p = splitBy(s, pattern(a0, n)); if (p[p.length - 1] === '') p.pop(); return itFromArray(p.map(sv), 'Split'); }
+      case 'splitn': { const k = Number(deref(a0).v); const pat = pattern(a1, n); const parts = []; let start = 0; while (parts.length < k - 1) { const m = findPat(s, pat, start); if (!m) break; parts.push(s.slice(start, m[0])); start = m[1]; } parts.push(s.slice(start)); return itFromArray(parts.map(sv), 'SplitN'); }
+      case 'split_once': { const m = findPat(s, pattern(a0, n), 0); return m ? mkSome(mkTuple([sv(s.slice(0, m[0])), sv(s.slice(m[1]))])) : mkNone(); }
+      case 'rsplit_once': { const p = deref(a0).v; const i = s.lastIndexOf(p); return i >= 0 ? mkSome(mkTuple([sv(s.slice(0, i)), sv(s.slice(i + p.length))])) : mkNone(); }
+      case 'split_at': { const i = byteToIdx(s, Number(deref(a0).v)); return mkTuple([sv(s.slice(0, i)), sv(s.slice(i))]); }
+      case 'trim': return sv(s.trim()); case 'trim_start': return sv(s.replace(/^\s+/, '')); case 'trim_end': return sv(s.replace(/\s+$/, ''));
+      case 'trim_matches': case 'trim_start_matches': case 'trim_end_matches': {
+        const pat = pattern(a0, n); let st = 0, en = s.length;
+        const chars = Array.from(s); let i = 0, j = chars.length;
+        const m = (c) => (pat.kind === 'str' ? c === pat.s : pat.f(c));
+        if (pat.kind === 'str' && pat.s.length > 1) { let r = s; if (name !== 'trim_end_matches') while (r.startsWith(pat.s)) r = r.slice(pat.s.length); if (name !== 'trim_start_matches') while (r.endsWith(pat.s)) r = r.slice(0, -pat.s.length); return sv(r); }
+        if (name !== 'trim_end_matches') while (i < j && m(chars[i])) i++;
+        if (name !== 'trim_start_matches') while (j > i && m(chars[j - 1])) j--;
+        void st; void en; return sv(chars.slice(i, j).join(''));
+      }
+      case 'strip_prefix': { const p = deref(a0).v; return s.startsWith(p) ? mkSome(sv(s.slice(p.length))) : mkNone(); }
+      case 'strip_suffix': { const p = deref(a0).v; return s.endsWith(p) ? mkSome(sv(s.slice(0, s.length - p.length))) : mkNone(); }
+      case 'to_uppercase': return mkString(s.toUpperCase()); case 'to_lowercase': return mkString(s.toLowerCase());
+      case 'to_ascii_uppercase': return mkString(s.replace(/[a-z]/g, (c) => c.toUpperCase())); case 'to_ascii_lowercase': return mkString(s.replace(/[A-Z]/g, (c) => c.toLowerCase()));
+      case 'make_ascii_uppercase': v.v = s.replace(/[a-z]/g, (c) => c.toUpperCase()); return UNIT;
+      case 'make_ascii_lowercase': v.v = s.replace(/[A-Z]/g, (c) => c.toLowerCase()); return UNIT;
+      case 'contains': return mkBool(findPat(s, pattern(a0, n), 0) !== null);
+      case 'starts_with': { const p = pattern(a0, n); if (p.kind === 'str') return mkBool(s.startsWith(p.s)); return mkBool(s.length > 0 && p.f(Array.from(s)[0])); }
+      case 'ends_with': { const p = pattern(a0, n); if (p.kind === 'str') return mkBool(s.endsWith(p.s)); const cs = Array.from(s); return mkBool(cs.length > 0 && p.f(cs[cs.length - 1])); }
+      case 'find': { const m = findPat(s, pattern(a0, n), 0); return m ? mkSome(usize(idxToByte(s, m[0]))) : mkNone(); }
+      case 'rfind': { const p = pattern(a0, n); if (p.kind === 'str') { const i = s.lastIndexOf(p.s); return i >= 0 ? mkSome(usize(idxToByte(s, i))) : mkNone(); } let last = null; let i = 0; for (const c of s) { if (p.f(c)) last = i; i += c.length; } return last === null ? mkNone() : mkSome(usize(idxToByte(s, last))); }
+      case 'matches': { const p = pattern(a0, n); const res = []; let st = 0; for (;;) { const m = findPat(s, p, st); if (!m || m[1] === m[0]) break; res.push(sv(s.slice(m[0], m[1]))); st = m[1]; } return itFromArray(res, 'Matches'); }
+      case 'replace': { const p = pattern(a0, n); const to = deref(a1).v; if (p.kind === 'str') return mkString(s.split(p.s).join(to)); return mkString(Array.from(s).map((c) => (p.f(c) ? to : c)).join('')); }
+      case 'replacen': { const p = deref(a0).v; const to = deref(a1).v; let k = Number(deref(args[2]).v); let r = s; let idx = 0; let res = ''; while (k-- > 0) { const i = r.indexOf(p, idx); if (i < 0) break; res += r.slice(idx, i) + to; idx = i + p.length; } res += r.slice(idx); return mkString(res); }
+      case 'repeat': return mkString(s.repeat(Number(deref(a0).v)));
+      case 'parse': return parseStr(s, n.turbofish ? n.turbofish[0] : ty, n);
+      case 'eq_ignore_ascii_case': return mkBool(s.toLowerCase() === deref(a0).v.toLowerCase());
+      case 'is_char_boundary': return mkBool(byteToIdx(s, Number(deref(a0).v)) >= 0);
+      case 'get': { const r = deref(a0); if (r.k === 'range') { const bl = utf8Len(s); const lo = r.lo ? Number(deref(r.lo).v) : 0, hi = r.hi ? Number(deref(r.hi).v) + (r.incl ? 1 : 0) : bl; if (lo > hi || hi > bl) return mkNone(); const ia = byteToIdx(s, lo), ib = byteToIdx(s, hi); if (ia < 0 || ib < 0) return mkNone(); return mkSome(sv(s.slice(ia, ib))); } return mkNone(); }
+      case 'chars_count': return usize(Array.from(s).length);
+      case 'cmp': return mkOrd(cmpVals(v, a0, n));
+      case 'eq': return mkBool(valEq(v, a0, n));
+      case 'extend': { req(); const it = toIter(a0, n); let x; while ((x = it.next()) !== DONE) v.v += deref(x).v; return UNIT; }
+      case 'drain': { req(); const r = deref(a0); const bl = utf8Len(s); const lo = r.lo ? Number(deref(r.lo).v) : 0, hi = r.hi ? Number(deref(r.hi).v) + (r.incl ? 1 : 0) : bl; const ia = byteToIdx(s, lo), ib = byteToIdx(s, hi); const d = s.slice(ia, ib); v.v = s.slice(0, ia) + s.slice(ib); return itFromArray(Array.from(d).map(mkChar), 'Drain'); }
+      case 'char_count': return usize(Array.from(s).length);
+      case 'iter': throw cerr('E0599', 'no method named `iter` found for ' + descType(v) + ' in the current scope', [{ pos: n.namePos, end: n.nameEnd, text: 'method not found', primary: true }], ['help: because of UTF-8, strings are iterated explicitly: use `.chars()` for characters or `.bytes()` for raw bytes']);
+    }
+    return null;
+  }
+  function vecMethod(v, place, name, args, n, env, ty, info) {
+    const items = v.items; const a0 = args[0], a1 = args[1];
+    const elemRef = (i, mut) => mkRef({ get: () => items[i], set: (x) => { items[i] = x; if (v.parent) v.parent.items[v.offset + i] = x; } }, mut);
+    const idx = (a) => { const d = deref(a); if (d.k !== 'int') throw mismatch('usize', foundDesc(d), n); return Number(d.v); };
+    const fixed = () => { if (v.kind === 'array' || v.kind === 'slice') throw cerr('E0599', 'no method named `' + name + '` found for ' + (v.kind === 'array' ? 'array `' + typeName(v) + '`' : 'slice `' + typeName(v) + '`') + ' in the current scope', [{ pos: n.namePos, end: n.nameEnd, text: 'method not found', primary: true }], ['note: arrays and slices have a fixed length. Use a `Vec` (for example `vec![...]` or `.to_vec()`) to grow or shrink']); };
+    switch (name) {
+      case 'len': return usize(items.length);
+      case 'is_empty': return mkBool(items.length === 0);
+      case 'push': case 'push_back': fixed(); items.push(a0); return UNIT;
+      case 'push_front': fixed(); items.unshift(a0); return UNIT;
+      case 'pop': case 'pop_back': fixed(); return items.length ? mkSome(items.pop()) : mkNone();
+      case 'pop_front': fixed(); return items.length ? mkSome(items.shift()) : mkNone();
+      case 'front': case 'first': return items.length ? mkSome(elemRef(0, false)) : mkNone();
+      case 'back': case 'last': return items.length ? mkSome(elemRef(items.length - 1, false)) : mkNone();
+      case 'front_mut': case 'first_mut': return items.length ? mkSome(elemRef(0, true)) : mkNone();
+      case 'back_mut': case 'last_mut': return items.length ? mkSome(elemRef(items.length - 1, true)) : mkNone();
+      case 'get': case 'get_mut': {
+        const d = deref(a0);
+        if (d.k === 'range') { const lo = d.lo ? Number(deref(d.lo).v) : 0, hi = d.hi ? Number(deref(d.hi).v) + (d.incl ? 1 : 0) : items.length; if (lo > hi || hi > items.length) return mkNone(); return mkSome(mkVec(items.slice(lo, hi), 'slice')); }
+        const i = Number(d.v); return i >= 0 && i < items.length ? mkSome(elemRef(i, name === 'get_mut')) : mkNone();
+      }
+      case 'insert': { fixed(); const i = idx(a0); if (i > items.length) panic('insertion index (is ' + i + ') should be <= len (is ' + items.length + ')', n); items.splice(i, 0, a1); return UNIT; }
+      case 'remove': { fixed(); const i = idx(a0); if (v.kind === 'VecDeque') { if (i >= items.length) return mkNone(); return mkSome(items.splice(i, 1)[0]); } if (i >= items.length) panic('removal index (is ' + i + ') should be < len (is ' + items.length + ')', n); return items.splice(i, 1)[0]; }
+      case 'swap_remove': { fixed(); const i = idx(a0); if (i >= items.length) panic('swap_remove index (is ' + i + ') should be < len (is ' + items.length + ')', n); const x = items[i]; items[i] = items[items.length - 1]; items.pop(); return x; }
+      case 'clear': fixed(); items.length = 0; return UNIT;
+      case 'truncate': fixed(); { const k = idx(a0); if (k < items.length) items.length = k; } return UNIT;
+      case 'contains': { const x = a0; return mkBool(items.some((it) => valEq(it, x, n))); }
+      case 'iter': return vecIter(v, 'ref');
+      case 'iter_mut': return vecIter(v, 'refmut');
+      case 'into_iter': return info.viaRef === 'shared' ? vecIter(v, 'ref') : info.viaRef === 'mut' ? vecIter(v, 'refmut') : vecIter(v, 'move');
+      case 'sort': case 'sort_unstable': { sortItems(items, (x, y) => cmpVals(x, y, n, true)); return UNIT; }
+      case 'sort_by': case 'sort_unstable_by': { sortItems(items, (x, y) => variantIndex(callValue(a0, [mkRef(tempPlace(x), false), mkRef(tempPlace(y), false)], n)) - 1); return UNIT; }
+      case 'sort_by_key': case 'sort_unstable_by_key': case 'sort_by_cached_key': { sortItems(items, (x, y) => cmpVals(callValue(a0, [mkRef(tempPlace(x), false)], n), callValue(a0, [mkRef(tempPlace(y), false)], n), n, true)); return UNIT; }
+      case 'reverse': items.reverse(); return UNIT;
+      case 'dedup': { fixed(); const r = []; for (const x of items) if (!r.length || !valEq(r[r.length - 1], x, n)) r.push(x); items.length = 0; items.push(...r); return UNIT; }
+      case 'dedup_by_key': { fixed(); const r = []; let lastK = null; for (const x of items) { const k = callValue(a0, [mkRef(tempPlace(x), true)], n); if (!r.length || !valEq(lastK, k, n)) r.push(x); lastK = k; } items.length = 0; items.push(...r); return UNIT; }
+      case 'retain': case 'retain_mut': { fixed(); const r = items.filter((x, i) => truthy(callValue(a0, [mkRef({ get: () => items[i], set: (y) => { items[i] = y; } }, name === 'retain_mut')], n), n)); items.length = 0; items.push(...r); return UNIT; }
+      case 'extend': { fixed(); const it = toIter(a0, n); let x; while ((x = it.next()) !== DONE) items.push(x.k === 'ref' && isCopy(deref(x)) ? deref(x) : x); return UNIT; }
+      case 'extend_from_slice': { fixed(); for (const x of deref(a0).items) items.push(cloneVal(x, n)); return UNIT; }
+      case 'append': { fixed(); const o = derefRefs(a0); items.push(...o.items); o.items.length = 0; return UNIT; }
+      case 'drain': { fixed(); const r = deref(a0); const [lo, hi] = rangeBounds(r, items.length, n); const d = items.splice(lo, hi - lo); return itFromArray(d, 'Drain'); }
+      case 'split_off': { fixed(); const i = idx(a0); return mkVec(items.splice(i), v.kind); }
+      case 'resize': { fixed(); const k = idx(a0); while (items.length > k) items.pop(); while (items.length < k) items.push(cloneVal(a1, n)); return UNIT; }
+      case 'fill': for (let i = 0; i < items.length; i++) items[i] = cloneVal(a0, n); return UNIT;
+      case 'swap': { const i = idx(a0), j = idx(a1); if (i >= items.length || j >= items.length) panic('index out of bounds: the len is ' + items.length + ' but the index is ' + Math.max(i, j), n); const t = items[i]; items[i] = items[j]; items[j] = t; return UNIT; }
+      case 'rotate_left': { const k = idx(a0); items.push(...items.splice(0, k)); return UNIT; }
+      case 'rotate_right': { const k = idx(a0); items.unshift(...items.splice(items.length - k, k)); return UNIT; }
+      case 'join': case 'concat': {
+        const sep = name === 'join' ? deref(a0).v : '';
+        if (items.length && deref(items[0]).k === 'vec') return mkVec(items.flatMap((x) => deref(x).items));
+        return mkString(items.map((x) => { const d = deref(x); if (d.k !== 'str' && d.k !== 'String' && d.k !== 'char') throw cerr('E0599', 'the method `' + name + '` exists for ' + descType(v) + ', but its trait bounds were not satisfied', [{ pos: n.namePos, end: n.nameEnd, text: 'only works on lists of strings', primary: true }], ['help: convert the items first, for example `.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ")`']); return d.v; }).join(sep));
+      }
+      case 'windows': { const k = idx(a0); const res = []; for (let i = 0; i + k <= items.length; i++) res.push(mkVec(items.slice(i, i + k), 'slice')); return itFromArray(res, 'Windows'); }
+      case 'chunks': case 'chunks_exact': { const k = idx(a0); const res = []; for (let i = 0; i < items.length; i += k) { if (name === 'chunks_exact' && i + k > items.length) break; res.push(mkVec(items.slice(i, i + k), 'slice')); } return itFromArray(res, 'Chunks'); }
+      case 'split_at': { const i = idx(a0); if (i > items.length) panic('mid > len', n); return mkTuple([mkVec(items.slice(0, i), 'slice'), mkVec(items.slice(i), 'slice')]); }
+      case 'split_first': return items.length ? mkSome(mkTuple([elemRef(0, false), mkVec(items.slice(1), 'slice')])) : mkNone();
+      case 'split_last': return items.length ? mkSome(mkTuple([elemRef(items.length - 1, false), mkVec(items.slice(0, -1), 'slice')])) : mkNone();
+      case 'to_vec': case 'into_vec': return mkVec(items.map((x) => cloneVal(x, n)), 'Vec');
+      case 'as_slice': case 'as_mut_slice': return mkRef(place, name === 'as_mut_slice');
+      case 'capacity': return usize(items.length);
+      case 'binary_search': { let lo = 0, hi = items.length; while (lo < hi) { const mid = (lo + hi) >> 1; const c = cmpVals(items[mid], a0, n, true); if (c === 0) return mkOk(usize(mid)); if (c < 0) lo = mid + 1; else hi = mid; } return mkErr(usize(lo)); }
+      case 'starts_with': { const o = deref(a0).items; return mkBool(o.length <= items.length && o.every((x, i) => valEq(x, items[i], n))); }
+      case 'ends_with': { const o = deref(a0).items; const off = items.length - o.length; return mkBool(off >= 0 && o.every((x, i) => valEq(x, items[off + i], n))); }
+      case 'repeat': { const k = idx(a0); const r = []; for (let i = 0; i < k; i++) for (const x of items) r.push(cloneVal(x, n)); return mkVec(r); }
+      case 'is_sorted': { for (let i = 1; i < items.length; i++) if (cmpVals(items[i - 1], items[i], n) > 0) return FALSE; return TRUE; }
+      case 'clone': return cloneVal(v, n);
+      case 'eq': return mkBool(valEq(v, a0, n));
+      case 'into_boxed_slice': return v;
+      case 'copy_from_slice': case 'clone_from_slice': { const o = deref(a0).items; if (o.length !== items.length) panic('source slice length (' + o.length + ') does not match destination slice length (' + items.length + ')', n); for (let i = 0; i < o.length; i++) { items[i] = cloneVal(o[i], n); if (v.parent) v.parent.items[v.offset + i] = items[i]; } return UNIT; }
+      case 'range': break;
+    }
+    // iterator methods directly on Vec (common mistake): suggest .iter()
+    if (['map', 'filter', 'sum', 'fold', 'for_each', 'enumerate', 'zip', 'rev', 'any', 'all', 'count', 'max', 'min', 'collect', 'position', 'find'].includes(name)) {
+      throw cerr('E0599', '`' + typeName(v) + '` is not an iterator', [{ pos: n.namePos, end: n.nameEnd, text: '`' + typeName(v) + '` is not an iterator', primary: true }], ['help: call `.iter()` first: `' + (n.recv ? srcOf(n.recv) : 'v') + '.iter().' + name + '(...)`', 'note: iterators are lazy views over a collection. `.iter()` borrows the items, `.into_iter()` takes ownership']);
+    }
+    return null;
+  }
+  function sortItems(items, cmp) {
+    const idxd = items.map((x, i) => [x, i]);
+    idxd.sort((a, b) => { const c = cmp(a[0], b[0]); return c !== 0 && !Number.isNaN(c) ? c : a[1] - b[1]; });
+    for (let i = 0; i < items.length; i++) items[i] = idxd[i][0];
+  }
+  function mapMethod(v, name, args, n, env, ty) {
+    const m = v.m; const a0 = args[0], a1 = args[1];
+    const vref = (e, mut) => mkRef({ get: () => e.v, set: (x) => { e.v = x; } }, mut);
+    switch (name) {
+      case 'insert': { const ks = keyOf(a0, n.args[0]); const old = m.get(ks); if (old) { const o = old.v; old.v = a1; return mkSome(o); } m.set(ks, { k: a0, v: a1 }); return mkNone(); }
+      case 'get': { const e = m.get(keyOf(a0, n)); return e ? mkSome(vref(e, false)) : mkNone(); }
+      case 'get_mut': { const e = m.get(keyOf(a0, n)); return e ? mkSome(vref(e, true)) : mkNone(); }
+      case 'get_key_value': { const e = m.get(keyOf(a0, n)); return e ? mkSome(mkTuple([mkRef(tempPlace(e.k), false), vref(e, false)])) : mkNone(); }
+      case 'contains_key': return mkBool(m.has(keyOf(a0, n)));
+      case 'remove': { const ks = keyOf(a0, n); const e = m.get(ks); if (!e) return mkNone(); m.delete(ks); return mkSome(e.v); }
+      case 'remove_entry': { const ks = keyOf(a0, n); const e = m.get(ks); if (!e) return mkNone(); m.delete(ks); return mkSome(mkTuple([e.k, e.v])); }
+      case 'len': return usize(m.size);
+      case 'is_empty': return mkBool(m.size === 0);
+      case 'clear': m.clear(); return UNIT;
+      case 'keys': { const it = mapIter(v, 'ref'); return new It(() => { const t = it.next(); return t === DONE ? DONE : t.items[0]; }, 'Keys'); }
+      case 'into_keys': { const it = mapIter(v, 'move'); return new It(() => { const t = it.next(); return t === DONE ? DONE : t.items[0]; }, 'IntoKeys'); }
+      case 'values': case 'values_mut': { const it = mapIter(v, name === 'values_mut' ? 'refmut' : 'ref'); return new It(() => { const t = it.next(); return t === DONE ? DONE : t.items[1]; }, 'Values'); }
+      case 'into_values': { const it = mapIter(v, 'move'); return new It(() => { const t = it.next(); return t === DONE ? DONE : t.items[1]; }, 'IntoValues'); }
+      case 'iter': return mapIter(v, 'ref');
+      case 'iter_mut': return mapIter(v, 'refmut');
+      case 'into_iter': return mapIter(v, 'move');
+      case 'entry': return { k: 'entry', map: v, key: a0, ks: keyOf(a0, n) };
+      case 'retain': { for (const [ks, e] of [...m]) if (!truthy(callValue(a0, [mkRef(tempPlace(e.k), false), vref(e, true)], n), n)) m.delete(ks); return UNIT; }
+      case 'extend': { const it = toIter(a0, n); let x; while ((x = it.next()) !== DONE) { const t = deref(x); m.set(keyOf(t.items[0], n), { k: t.items[0], v: t.items[1] }); } return UNIT; }
+      case 'clone': return cloneVal(v, n);
+      case 'eq': return mkBool(valEq(v, a0, n));
+      case 'first_key_value': case 'last_key_value': { const ents = sortedEntries(v); if (!ents.length) return mkNone(); const e = name === 'first_key_value' ? ents[0] : ents[ents.length - 1]; return mkSome(mkTuple([mkRef(tempPlace(e.k), false), vref(e, false)])); }
+    }
+    return null;
+  }
+  function entryMethod(v, name, args, n) {
+    const m = v.map.m; const ks = v.ks;
+    const ref = () => { const e = m.get(ks); return mkRef({ get: () => e.v, set: (x) => { e.v = x; } }, true); };
+    switch (name) {
+      case 'or_insert': if (!m.has(ks)) m.set(ks, { k: v.key, v: args[0] }); return ref();
+      case 'or_insert_with': if (!m.has(ks)) m.set(ks, { k: v.key, v: callValue(args[0], [], n) }); return ref();
+      case 'or_insert_with_key': if (!m.has(ks)) m.set(ks, { k: v.key, v: callValue(args[0], [mkRef(tempPlace(v.key), false)], n) }); return ref();
+      case 'or_default': {
+        if (!m.has(ks)) { const sample = m.values().next().value; m.set(ks, { k: v.key, v: v.map.valTy ? defaultFor(v.map.valTy, n) : sample ? defaultLike(sample.v, n) : mkInt(0n, null) }); }
+        return ref();
+      }
+      case 'and_modify': { if (m.has(ks)) callValue(args[0], [ref()], n); return v; }
+      case 'key': return mkRef(tempPlace(v.key), false);
+    }
+    throw cerr('E0599', 'no method named `' + name + '` found for enum `Entry` in the current scope', [{ pos: n.namePos, end: n.nameEnd, text: 'method not found', primary: true }]);
+  }
+  function setMethod(v, name, args, n) {
+    const m = v.m; const a0 = args[0];
+    const other = () => deref(a0);
+    switch (name) {
+      case 'insert': { const ks = keyOf(a0, n); if (m.has(ks)) return FALSE; m.set(ks, a0); return TRUE; }
+      case 'contains': return mkBool(m.has(keyOf(a0, n)));
+      case 'remove': return mkBool(m.delete(keyOf(a0, n)));
+      case 'take': { const ks = keyOf(a0, n); const e = m.get(ks); if (!e) return mkNone(); m.delete(ks); return mkSome(e); }
+      case 'get': { const e = m.get(keyOf(a0, n)); return e ? mkSome(mkRef(tempPlace(e), false)) : mkNone(); }
+      case 'len': return usize(m.size);
+      case 'is_empty': return mkBool(m.size === 0);
+      case 'clear': m.clear(); return UNIT;
+      case 'iter': return new It((() => { const it = setIter(v); return () => { const x = it.next(); return x === DONE ? DONE : mkRef(tempPlace(x), false); }; })(), 'Iter');
+      case 'into_iter': return setIter(v);
+      case 'extend': { const it = toIter(a0, n); let x; while ((x = it.next()) !== DONE) { const d = isCopy(deref(x)) ? deref(x) : x; m.set(keyOf(d, n), d); } return UNIT; }
+      case 'union': { const o = other(); const res = [...sortedEntries(v)]; for (const e of sortedEntries(o)) if (!m.has(keyOf(e, n))) res.push(e); return itFromArray(res.map((x) => mkRef(tempPlace(x), false)), 'Union'); }
+      case 'intersection': { const o = other(); return itFromArray(sortedEntries(v).filter((e) => o.m.has(keyOf(e, n))).map((x) => mkRef(tempPlace(x), false)), 'Intersection'); }
+      case 'difference': { const o = other(); return itFromArray(sortedEntries(v).filter((e) => !o.m.has(keyOf(e, n))).map((x) => mkRef(tempPlace(x), false)), 'Difference'); }
+      case 'symmetric_difference': { const o = other(); return itFromArray(sortedEntries(v).filter((e) => !o.m.has(keyOf(e, n))).concat(sortedEntries(o).filter((e) => !m.has(keyOf(e, n)))).map((x) => mkRef(tempPlace(x), false)), 'SymmetricDifference'); }
+      case 'is_subset': { const o = other(); return mkBool([...m.keys()].every((k) => o.m.has(k))); }
+      case 'is_superset': { const o = other(); return mkBool([...o.m.keys()].every((k) => m.has(k))); }
+      case 'is_disjoint': { const o = other(); return mkBool([...m.keys()].every((k) => !o.m.has(k))); }
+      case 'retain': { for (const [ks, e] of [...m]) if (!truthy(callValue(a0, [mkRef(tempPlace(e), false)], n), n)) m.delete(ks); return UNIT; }
+      case 'clone': return cloneVal(v, n);
+      case 'eq': return mkBool(valEq(v, a0, n));
+    }
+    return null;
+  }
+  function optMethod(v, place, name, args, n, env, ty) {
+    const isOpt = v.en === 'Option';
+    const good = isOpt ? v.variant === 'Some' : v.variant === 'Ok';
+    const inner = v.vals[0];
+    const a0 = args[0], a1 = args[1];
+    const errDbg = () => debug(inner, false, '', n);
+    switch (name) {
+      case 'is_some': case 'is_ok': return mkBool(good);
+      case 'is_none': case 'is_err': return mkBool(!good);
+      case 'is_some_and': case 'is_ok_and': return mkBool(good && truthy(callValue(a0, [inner], n), n));
+      case 'is_none_or': return mkBool(!good || truthy(callValue(a0, [inner], n), n));
+      case 'unwrap':
+        if (good) return inner;
+        if (isOpt) panic('called `Option::unwrap()` on a `None` value', { pos: n.namePos });
+        panic('called `Result::unwrap()` on an `Err` value: ' + errDbg(), { pos: n.namePos });
+        break;
+      case 'expect':
+        if (good) return inner;
+        panic(deref(a0).v + (isOpt ? '' : ': ' + errDbg()), { pos: n.namePos });
+        break;
+      case 'unwrap_err': case 'expect_err':
+        if (!good) return inner;
+        panic(name === 'expect_err' ? deref(a0).v + ': ' + debug(inner, false, '', n) : 'called `Result::unwrap_err()` on an `Ok` value: ' + debug(inner, false, '', n), { pos: n.namePos });
+        break;
+      case 'unwrap_or': return good ? inner : a0;
+      case 'unwrap_or_else': return good ? inner : callValue(a0, isOpt ? [] : [inner], n);
+      case 'unwrap_or_default': return good ? inner : defaultFor(ty, n);
+      case 'map': if (!good) return v; return isOpt ? mkSome(callValue(a0, [inner], n)) : mkOk(callValue(a0, [inner], n));
+      case 'map_err': if (good || isOpt) return v; return mkErr(callValue(a0, [inner], n));
+      case 'map_or': return good ? callValue(a1, [inner], n) : a0;
+      case 'map_or_else': return good ? callValue(a1, [inner], n) : callValue(a0, isOpt ? [] : [inner], n);
+      case 'and_then': return good ? callValue(a0, [inner], n) : v;
+      case 'and': return good ? a0 : v;
+      case 'or': return good ? v : a0;
+      case 'or_else': return good ? v : callValue(a0, isOpt ? [] : [inner], n);
+      case 'xor': { const o = deref(a0); const og = o.variant === 'Some'; return good && !og ? v : !good && og ? o : mkNone(); }
+      case 'ok_or': return good ? mkOk(inner) : mkErr(a0);
+      case 'ok_or_else': return good ? mkOk(inner) : mkErr(callValue(a0, [], n));
+      case 'ok': return good ? mkSome(inner) : mkNone();
+      case 'err': return !good ? mkSome(inner) : mkNone();
+      case 'filter': return good && truthy(callValue(a0, [mkRef(tempPlace(inner), false)], n), n) ? v : mkNone();
+      case 'flatten': return good ? inner : v;
+      case 'zip': { const o = deref(a0); return good && o.variant === 'Some' ? mkSome(mkTuple([inner, o.vals[0]])) : mkNone(); }
+      case 'take': { const old = place.get(); place.set(mkNone()); return derefRefs(old); }
+      case 'replace': { const old = place.get(); place.set(mkSome(a0)); return derefRefs(old); }
+      case 'insert': { place.set(mkSome(a0)); const cur = place.get(); return mkRef({ get: () => cur.vals[0], set: (x) => { cur.vals[0] = x; } }, true); }
+      case 'get_or_insert_with': case 'get_or_insert': { if (!good) place.set(mkSome(name === 'get_or_insert' ? a0 : callValue(a0, [], n))); const cur = place.get(); return mkRef({ get: () => cur.vals[0], set: (x) => { cur.vals[0] = x; } }, true); }
+      case 'as_ref': case 'as_mut': case 'as_deref': case 'as_deref_mut': {
+        if (!good) return v;
+        const cur = v; const r = mkRef({ get: () => cur.vals[0], set: (x) => { cur.vals[0] = x; } }, name === 'as_mut' || name === 'as_deref_mut');
+        if (name === 'as_deref') { const d = deref(inner); if (d.k === 'String') return isOpt ? mkSome(mkStr(d.v)) : mkOk(mkStr(d.v)); }
+        return isOpt ? mkSome(r) : mkOk(r);
+      }
+      case 'iter': case 'into_iter': return itFromArray(good ? [inner] : []);
+      case 'cloned': case 'copied': return good ? (isOpt ? mkSome(cloneVal(deref(inner), n)) : mkOk(cloneVal(deref(inner), n))) : v;
+      case 'clone': return cloneVal(v, n);
+      case 'unwrap_unchecked': return inner;
+      case 'eq': return mkBool(valEq(v, a0, n));
+      case 'contains': return mkBool(good && valEq(inner, a0, n));
+      case 'is_some_or': return mkBool(true);
+    }
+    return null;
+  }
+  function iterMethod(it, name, n, env, ty, args, info, recvNode) {
+    const a0 = args ? args[0] : undefined, a1 = args ? args[1] : undefined;
+    const f1 = (x) => callValue(a0, [x], n);
+    const refOf = (x) => mkRef(tempPlace(x), false);
+    switch (name) {
+      case 'next': case 'next_back': { if (name === 'next_back') { const arr = []; let x; while ((x = it.next()) !== DONE) arr.push(x); const last = arr.pop(); let i = 0; it.nx = () => (i < arr.length ? arr[i++] : DONE); it.hasPeek = false; return mkOpt(last); } return mkOpt(it.next()); }
+      case 'peek': { const x = it.peek(); return x === DONE ? mkNone() : mkSome(refOf(x)); }
+      case 'next_if': { const x = it.peek(); if (x !== DONE && truthy(callValue(a0, [refOf(x)], n), n)) { it.next(); return mkSome(x); } return mkNone(); }
+      case 'by_ref': return it;
+      case 'iter': case 'into_iter': case 'peekable': case 'fuse': return name === 'peekable' ? new It(() => it.next(), 'Peekable') : it;
+      case 'map': return new It(() => { const x = it.next(); return x === DONE ? DONE : f1(x); }, 'Map');
+      case 'filter': return new It(() => { for (;;) { const x = it.next(); if (x === DONE) return DONE; if (truthy(callValue(a0, [refOf(x)], n), n)) return x; } }, 'Filter');
+      case 'filter_map': return new It(() => { for (;;) { const x = it.next(); if (x === DONE) return DONE; const r = f1(x); if (r.variant === 'Some') return r.vals[0]; } }, 'FilterMap');
+      case 'map_while': return new It(() => { const x = it.next(); if (x === DONE) return DONE; const r = f1(x); return r.variant === 'Some' ? r.vals[0] : DONE; }, 'MapWhile');
+      case 'flat_map': { let cur = null; return new It(() => { for (;;) { if (cur) { const y = cur.next(); if (y !== DONE) return y; } const x = it.next(); if (x === DONE) return DONE; cur = toIter(f1(x), n); } }, 'FlatMap'); }
+      case 'flatten': { let cur = null; return new It(() => { for (;;) { if (cur) { const y = cur.next(); if (y !== DONE) return y; } const x = it.next(); if (x === DONE) return DONE; cur = toIter(x, n); } }, 'Flatten'); }
+      case 'enumerate': { let i = 0; return new It(() => { const x = it.next(); return x === DONE ? DONE : mkTuple([usize(i++), x]); }, 'Enumerate'); }
+      case 'zip': { const o = toIter(a0, n); return new It(() => { const x = it.next(); if (x === DONE) return DONE; const y = o.next(); if (y === DONE) return DONE; return mkTuple([x, y]); }, 'Zip'); }
+      case 'chain': { const o = toIter(a0, n); let first = true; return new It(() => { if (first) { const x = it.next(); if (x !== DONE) return x; first = false; } return o.next(); }, 'Chain'); }
+      case 'rev': { const arr = []; let x; while ((x = it.next()) !== DONE) { arr.push(x); tick(); } let i = arr.length; return new It(() => (i > 0 ? arr[--i] : DONE), 'Rev'); }
+      case 'take': { let k = Number(deref(a0).v); return new It(() => (k-- > 0 ? it.next() : DONE), 'Take'); }
+      case 'skip': { let k = Number(deref(a0).v); return new It(() => { while (k > 0) { k--; if (it.next() === DONE) return DONE; } return it.next(); }, 'Skip'); }
+      case 'step_by': { const k = Number(deref(a0).v); if (k === 0) panic('assertion failed: step != 0', n); let first = true; return new It(() => { if (first) { first = false; return it.next(); } for (let i = 0; i < k - 1; i++) if (it.next() === DONE) return DONE; return it.next(); }, 'StepBy'); }
+      case 'take_while': { let done = false; return new It(() => { if (done) return DONE; const x = it.next(); if (x === DONE || !truthy(callValue(a0, [refOf(x)], n), n)) { done = true; return DONE; } return x; }, 'TakeWhile'); }
+      case 'skip_while': { let skipping = true; return new It(() => { for (;;) { const x = it.next(); if (x === DONE) return DONE; if (skipping && truthy(callValue(a0, [refOf(x)], n), n)) continue; skipping = false; return x; } }, 'SkipWhile'); }
+      case 'inspect': return new It(() => { const x = it.next(); if (x !== DONE) callValue(a0, [refOf(x)], n); return x; }, 'Inspect');
+      case 'cloned': case 'copied': return new It(() => { const x = it.next(); return x === DONE ? DONE : (name === 'copied' ? copyVal(deref(x)) : cloneVal(derefRefs(x), n)); }, name === 'cloned' ? 'Cloned' : 'Copied');
+      case 'scan': { const st = mkRef(tempPlace(a0), true); return new It(() => { const x = it.next(); if (x === DONE) return DONE; const r = callValue(a1, [st, x], n); return r.variant === 'Some' ? r.vals[0] : DONE; }, 'Scan'); }
+      case 'cycle': { const arr = []; let x; while ((x = it.next()) !== DONE) arr.push(x); let i = 0; return new It(() => (arr.length ? arr[i++ % arr.length] : DONE), 'Cycle'); }
+      case 'chunks': break;
+      case 'collect': return collectInto(it, n.turbofish ? n.turbofish[0] : ty, n);
+      case 'sum': case 'product': {
+        const tyN = n.turbofish && n.turbofish[0] ? n.turbofish[0].name : ty && ty.tk === 'path' ? ty.name : null;
+        let acc = null; let x;
+        while ((x = it.next()) !== DONE) { const d = deref(x); if (acc === null) acc = name === 'sum' ? numZero(d, tyN) : (d.k === 'float' || tyN === 'f64' || tyN === 'f32' ? mkFloat(1, tyN || d.ty) : mkInt(1n, tyN || d.ty)); acc = arith(name === 'sum' ? '+' : '*', acc, d, n); tick(); }
+        if (acc === null) acc = name === 'sum' ? numZero(null, tyN) : (tyN === 'f64' || tyN === 'f32' ? mkFloat(1, tyN) : mkInt(1n, tyN));
+        return tyN ? coerce(acc, { tk: 'path', name: tyN, args: [] }, n) : acc;
+      }
+      case 'count': { let c = 0; while (it.next() !== DONE) { c++; if ((c & 4095) === 0) tick(); } return usize(c); }
+      case 'last': { let last = DONE, x; while ((x = it.next()) !== DONE) last = x; return mkOpt(last); }
+      case 'nth': { let k = Number(deref(a0).v); let x; while ((x = it.next()) !== DONE) { if (k-- === 0) return mkSome(x); } return mkNone(); }
+      case 'min': case 'max': {
+        let best = DONE, x;
+        while ((x = it.next()) !== DONE) { if (best === DONE) { best = x; continue; } const c = cmpVals(x, best, n, true); if (name === 'max' ? c >= 0 : c < 0) best = x; }
+        return mkOpt(best);
+      }
+      case 'min_by_key': case 'max_by_key': {
+        let best = DONE, bk = null, x;
+        while ((x = it.next()) !== DONE) { const k = callValue(a0, [refOf(x)], n); if (best === DONE) { best = x; bk = k; continue; } const c = cmpVals(k, bk, n, true); if (name === 'max_by_key' ? c >= 0 : c < 0) { best = x; bk = k; } }
+        return mkOpt(best);
+      }
+      case 'min_by': case 'max_by': {
+        let best = DONE, x;
+        while ((x = it.next()) !== DONE) { if (best === DONE) { best = x; continue; } const c = variantIndex(callValue(a0, [refOf(x), refOf(best)], n)) - 1; if (name === 'max_by' ? c >= 0 : c < 0) best = x; }
+        return mkOpt(best);
+      }
+      case 'fold': { let acc = a0; let x; while ((x = it.next()) !== DONE) { acc = callValue(a1, [acc, x], n); tick(); } return acc; }
+      case 'try_fold': { let acc = a0; let x; while ((x = it.next()) !== DONE) { const r = callValue(a1, [acc, x], n); if (r.variant === 'None' || r.variant === 'Err') return r; acc = r.vals[0]; } return { k: 'enum', en: 'Option', variant: 'Some', vals: [acc] }; }
+      case 'reduce': { let acc = it.next(); if (acc === DONE) return mkNone(); let x; while ((x = it.next()) !== DONE) acc = callValue(a0, [acc, x], n); return mkSome(acc); }
+      case 'any': { let x; while ((x = it.next()) !== DONE) if (truthy(f1(x), n)) return TRUE; return FALSE; }
+      case 'all': { let x; while ((x = it.next()) !== DONE) if (!truthy(f1(x), n)) return FALSE; return TRUE; }
+      case 'find': { let x; while ((x = it.next()) !== DONE) if (truthy(callValue(a0, [refOf(x)], n), n)) return mkSome(x); return mkNone(); }
+      case 'find_map': { let x; while ((x = it.next()) !== DONE) { const r = f1(x); if (r.variant === 'Some') return r; } return mkNone(); }
+      case 'position': { let i = 0, x; while ((x = it.next()) !== DONE) { if (truthy(f1(x), n)) return mkSome(usize(i)); i++; } return mkNone(); }
+      case 'for_each': { let x; while ((x = it.next()) !== DONE) { f1(x); tick(); } return UNIT; }
+      case 'partition': { const a = [], b = []; let x; while ((x = it.next()) !== DONE) (truthy(callValue(a0, [refOf(x)], n), n) ? a : b).push(x); return mkTuple([mkVec(a), mkVec(b)]); }
+      case 'unzip': { const a = [], b = []; let x; while ((x = it.next()) !== DONE) { const t = deref(x); a.push(t.items[0]); b.push(t.items[1]); } return mkTuple([mkVec(a), mkVec(b)]); }
+      case 'size_hint': return mkTuple([usize(0), mkNone()]);
+      case 'eq': { const o = toIter(a0, n); for (;;) { const x = it.next(), y = o.next(); if (x === DONE || y === DONE) return mkBool(x === y); if (!valEq(x, y, n)) return FALSE; } }
+      case 'sorted': break;
+      case 'len': { const arr = []; let x; while ((x = it.next()) !== DONE) arr.push(x); let i = 0; it.nx = () => (i < arr.length ? arr[i++] : DONE); it.hasPeek = false; return usize(arr.length); }
+      case 'is_empty': { const x = it.peek(); return mkBool(x === DONE); }
+    }
+    throw cerr('E0599', 'no method named `' + name + '` found for iterator in the current scope', [{ pos: n.namePos, end: n.nameEnd, text: 'method not found', primary: true }], name === 'sort' || name === 'sorted' ? ['help: collect into a `Vec` first, then call `.sort()` on it'] : ['note: if this is valid Rust, the teaching interpreter may not support it yet. Try the Rust Playground button.']);
+  }
+
+  // ---- operators ----
+  const OP_VERB = { '+': 'add', '-': 'subtract', '*': 'multiply', '/': 'divide', '%': 'calculate the remainder', '<<': 'shift left', '>>': 'shift right' };
+  const OP_TRAIT = { '+': ['Add', 'add'], '-': ['Sub', 'sub'], '*': ['Mul', 'mul'], '/': ['Div', 'div'], '%': ['Rem', 'rem'] };
+  function intOp(op, a, b, n) {
+    const isShift = op === '<<' || op === '>>';
+    if (!isShift && a.ty && b.ty && a.ty !== b.ty) throw cerr('E0308', 'mismatched types', [span(n.r || n, 'expected `' + a.ty + '`, found `' + b.ty + '`')], ['note: Rust never converts between integer types implicitly. Use `as`: `' + (n.r ? srcOf(n.r) : 'x') + ' as ' + a.ty + '`']);
+    const ty = isShift ? a.ty : (a.ty || b.ty);
+    const tt = ty || 'i32';
+    let r;
+    switch (op) {
+      case '+': r = a.v + b.v; break;
+      case '-': r = a.v - b.v; break;
+      case '*': r = a.v * b.v; break;
+      case '/': if (b.v === 0n) panic('attempt to divide by zero', n); r = a.v / b.v; break;
+      case '%': if (b.v === 0n) panic('attempt to calculate the remainder with a divisor of zero', n); r = a.v % b.v; break;
+      case '&': r = a.v & b.v; break;
+      case '|': r = a.v | b.v; break;
+      case '^': r = a.v ^ b.v; break;
+      case '<<': if (b.v >= BigInt(INT_BITS[tt]) || b.v < 0n) panic('attempt to shift left with overflow', n); r = wrapInt(a.v << b.v, tt); break;
+      case '>>': if (b.v >= BigInt(INT_BITS[tt]) || b.v < 0n) panic('attempt to shift right with overflow', n); r = a.v >> b.v; break;
+    }
+    if (ty) { const [lo, hi] = intRange(ty); if (r < lo || r > hi) panic('attempt to ' + OP_VERB[op] + ' with overflow', n); }
+    else { const [lo, hi] = intRange('i64'); if (r < lo || r > hi) panic('attempt to ' + OP_VERB[op] + ' with overflow', n); }
+    return mkInt(r, ty);
+  }
+  function floatOp(op, a, b, n) {
+    if (a.ty && b.ty && a.ty !== b.ty) throw cerr('E0308', 'mismatched types', [span(n.r || n, 'expected `' + a.ty + '`, found `' + b.ty + '`')]);
+    const ty = a.ty || b.ty;
+    let r;
+    switch (op) { case '+': r = a.v + b.v; break; case '-': r = a.v - b.v; break; case '*': r = a.v * b.v; break; case '/': r = a.v / b.v; break; case '%': r = a.v % b.v; break;
+      default: throw cerr('E0369', 'no implementation for `' + typeName(a) + ' ' + op + ' ' + typeName(b) + '`', [span(n)]); }
+    return mkFloat(r, ty);
+  }
+  function binop(op, l, r, n) {
+    const a = deref(l), b = deref(r);
+    if (a.k === 'int' && b.k === 'int') return intOp(op, a, b, n);
+    if (a.k === 'float' && b.k === 'float') return floatOp(op, a, b, n);
+    if ((a.k === 'int' && b.k === 'float') || (a.k === 'float' && b.k === 'int')) {
+      const ta = a.ty || (a.k === 'int' ? '{integer}' : '{float}'), tb = b.ty || (b.k === 'int' ? '{integer}' : '{float}');
+      const desc = { '+': 'cannot add `' + tb + '` to `' + ta + '`', '-': 'cannot subtract `' + tb + '` from `' + ta + '`', '*': 'cannot multiply `' + ta + '` by `' + tb + '`', '/': 'cannot divide `' + ta + '` by `' + tb + '`', '%': 'cannot calculate the remainder of `' + ta + '` divided by `' + tb + '`' }[op] || 'no implementation for `' + ta + ' ' + op + ' ' + tb + '`';
+      throw cerr('E0277', desc, [span(n, 'no implementation for `' + ta + ' ' + op + ' ' + tb + '`')], ['help: Rust never mixes integers and floats automatically. Convert one side, for example `' + (a.k === 'int' ? srcOf(n.l) + ' as f64' : srcOf(n.r) + ' as f64') + '`']);
+    }
+    if (op === '+' && (a.k === 'String' || a.k === 'str')) {
+      if (l.k === 'str' || l.k === 'ref') {
+        if (b.k === 'str' || b.k === 'String') throw cerr('E0369', 'cannot add `' + typeName(r) + '` to `' + typeName(l) + '`', [span(n.l, typeName(l)), span(n.r, typeName(r), false)], ['note: string concatenation requires an owned `String` on the left', 'help: create an owned `String` from a string reference: `' + srcOf(n.l) + '.to_owned()`']);
+      }
+      if (a.k === 'String' && l.k === 'String') {
+        if (r.k === 'String') throw mismatch('&str', '`String`', n.r, 'help: consider borrowing here: `&' + srcOf(n.r) + '`');
+        if (b.k === 'str' || b.k === 'String') { l.v = a.v + b.v; return l; }
+        if (b.k === 'char') throw mismatch('&str', '`char`', n.r);
+      }
+    }
+    if (a.k === 'struct' || a.k === 'enum') {
+      const tr = OP_TRAIT[op];
+      if (tr) {
+        const m = findTraitMethod(typeKey(a), tr[0], tr[1]);
+        if (m) return callFn(m, [r.k === 'ref' && m.params[0] && m.params[0].ty.tk !== 'ref' ? copyOrSelf(b) : r], l.k === 'ref' ? copyOrSelf(a) : l, typeKey(a), n);
+      }
+      throw cerr('E0369', 'cannot ' + (OP_VERB[op] || 'apply `' + op + '` to') + ' `' + typeName(b) + '` to `' + typeName(a) + '`', [span(n, 'no implementation for `' + typeName(a) + ' ' + op + ' ' + typeName(b) + '`')], ['note: an implementation of `std::ops::' + (tr ? tr[0] : op) + '` might be missing for `' + typeName(a) + '`']);
+    }
+    if (a.k === 'duration' && b.k === 'duration' && (op === '+' || op === '-')) return { k: 'duration', ns: op === '+' ? a.ns + b.ns : a.ns - b.ns };
+    if (a.k === 'duration' && b.k === 'int' && (op === '*' || op === '/')) return { k: 'duration', ns: op === '*' ? a.ns * Number(b.v) : a.ns / Number(b.v) };
+    if (a.k === 'instant' && b.k === 'instant' && op === '-') return { k: 'duration', ns: (a.t - b.t) * 1e6 };
+    if ((a.k === 'set') && (op === '&' || op === '|' || op === '-')) {
+      const m = new Map();
+      if (op === '|') { for (const [k, x] of a.m) m.set(k, x); for (const [k, x] of b.m) m.set(k, x); }
+      else if (op === '&') { for (const [k, x] of a.m) if (b.m.has(k)) m.set(k, x); }
+      else for (const [k, x] of a.m) if (!b.m.has(k)) m.set(k, x);
+      return { k: 'set', kind: a.kind, m };
+    }
+    if (a.k === 'bool' && b.k === 'bool' && (op === '&' || op === '|' || op === '^')) return mkBool(op === '&' ? a.v && b.v : op === '|' ? a.v || b.v : a.v !== b.v);
+    throw cerr('E0369', 'cannot ' + (OP_VERB[op] || 'apply `' + op + '` to') + ' `' + typeName(r) + '` ' + (op === '+' ? 'to' : op === '-' ? 'from' : 'and') + ' `' + typeName(l) + '`', [span(n, 'no implementation for `' + typeName(l) + ' ' + op + ' ' + typeName(r) + '`')]);
+  }
+  function copyOrSelf(v) { return isCopy(v) ? copyVal(v) : v; }
+  function castVal(v, ty, n) {
+    ty = resolveTy(ty);
+    const d = deref(v);
+    const tn = ty.tk === 'path' ? ty.name : null;
+    if (!tn) return v;
+    if (INT_BITS[tn]) {
+      if (d.k === 'int') return mkInt(wrapInt(d.v, tn), tn);
+      if (d.k === 'float') {
+        if (Number.isNaN(d.v)) return mkInt(0n, tn);
+        const [lo, hi] = intRange(tn);
+        if (d.v === Infinity) return mkInt(hi, tn); if (d.v === -Infinity) return mkInt(lo, tn);
+        let x = BigInt(Math.trunc(d.v)); if (x < lo) x = lo; if (x > hi) x = hi; return mkInt(x, tn);
+      }
+      if (d.k === 'char') return mkInt(wrapInt(BigInt(d.v.codePointAt(0)), tn), tn);
+      if (d.k === 'bool') return mkInt(d.v ? 1n : 0n, tn);
+      if (d.k === 'enum') return mkInt(BigInt(enumDisc(d)), tn);
+    }
+    if (tn === 'f64' || tn === 'f32') {
+      if (d.k === 'int') return mkFloat(Number(d.v), tn);
+      if (d.k === 'float') return mkFloat(d.v, tn);
+    }
+    if (tn === 'char') {
+      if (d.k === 'int' && d.ty === 'u8') return mkChar(String.fromCharCode(Number(d.v)));
+      if (d.k === 'char') return d;
+      if (d.k === 'int') throw cerr('E0604', 'only `u8` can be cast as `char`, not `' + (d.ty || 'i32') + '`', [span(n, 'invalid cast')], ['help: try `char::from_u32(' + srcOf(n.e) + ' as u32)` which returns an `Option<char>`']);
+    }
+    if (tn === 'bool' && d.k === 'int') throw cerr('E0054', 'cannot cast `' + (d.ty || 'i32') + '` as `bool`', [span(n, 'unsupported cast')], ['help: compare with zero instead: `' + srcOf(n.e) + ' != 0`']);
+    if (d.k === 'str' || d.k === 'String') throw cerr('E0605', 'non-primitive cast: `' + typeName(v) + '` as `' + tn + '`', [span(n, 'an `as` expression can only be used to convert between primitive types')], ['help: to turn text into a number use `.parse::<' + tn + '>()`']);
+    return v;
+  }
+  function enumDisc(v) {
+    const def = enums.get(v.en); if (!def) return 0;
+    let cur = -1;
+    for (const vr of def.variants) { cur = vr.disc ? Number(deref(ev(vr.disc, new Env(null))).v) : cur + 1; if (vr.name === v.variant) return cur; }
+    return 0;
+  }
+
+  // ---- patterns ----
+  function autoDeref(v, place, mode) {
+    while (v.k === 'ref') { mode = v.mut && mode !== 'ref' ? 'refmut' : 'ref'; place = v.place; v = v.place.get(); }
+    if (v.k === 'rc') { place = { get: () => v.cell.val, set: () => {} }; mode = 'ref'; v = v.cell.val; }
+    return [v, place, mode];
+  }
+  function patLitVal(lit) {
+    switch (lit.k) {
+      case 'int': return mkInt(lit.v, lit.suffix || null);
+      case 'float': return mkFloat(lit.v, lit.suffix || null);
+      case 'str': return mkStr(lit.v);
+      case 'char': return mkChar(lit.v);
+      case 'bool': return mkBool(lit.v);
+      case 'path': return globalValue(lit.segs, lit, new Env(null), null);
+    }
+  }
+  function variantMatches(segs, v) {
+    const last = segs[segs.length - 1];
+    if (v.k === 'enum') {
+      if (segs.length >= 2) { const en = segs[segs.length - 2]; if (en !== 'Self' && en !== v.en && !(G.aliases.has(en))) return null; }
+      return v.variant === last;
+    }
+    return null;
+  }
+  function itemPlace(arr, i) { return { get: () => arr[i], set: (x) => { arr[i] = x; } }; }
+  function matchPat(pat, v, place, env, mode, binds) {
+    switch (pat.pk) {
+      case 'wild': case 'rest': return true;
+      case 'bind': {
+        if (pat.sub && !matchPat(pat.sub, v, place, env, mode, binds)) return false;
+        let bv;
+        if (pat.byRef) bv = mkRef(place, pat.mut);
+        else if (mode === 'ref') bv = v.k === 'ref' ? v : mkRef(place, false);
+        else if (mode === 'refmut') bv = v.k === 'ref' ? v : mkRef(place, true);
+        else if (isCopy(v)) bv = copyVal(v);
+        else { bv = v; binds.moves = (binds.moves || 0) + 1; binds.movedName = pat.name; }
+        binds.push({ pat, val: bv });
+        return true;
+      }
+      case 'lit': { const d = deref(v); const lv = patLitVal(pat.v); return valEq(d, lv, pat); }
+      case 'range': {
+        const d = deref(v);
+        const lo = pat.lo ? patLitVal(pat.lo) : null, hi = pat.hi ? patLitVal(pat.hi) : null;
+        if (lo && cmpVals(d, lo, pat) < 0) return false;
+        if (hi && (pat.incl ? cmpVals(d, hi, pat) > 0 : cmpVals(d, hi, pat) >= 0)) return false;
+        return true;
+      }
+      case 'ref': {
+        if (v.k !== 'ref') throw cerr('E0308', 'mismatched types', [span(pat, 'expected `' + typeName(v) + '`, found `&_`')], ['help: remove the `&` from the pattern']);
+        return matchPat(pat.pat, v.place.get(), v.place, env, 'move', binds);
+      }
+      case 'tuple': {
+        const [d, , m] = autoDeref(v, place, mode);
+        if (d.k !== 'tuple') throw cerr('E0308', 'mismatched types', [span(pat, 'expected `' + typeName(d) + '`, found tuple')]);
+        return matchSeq(pat.elems, d.items, env, m, binds, pat);
+      }
+      case 'slice': {
+        const [d, , m] = autoDeref(v, place, mode);
+        if (d.k !== 'vec') throw cerr('E0529', 'expected an array or slice, found `' + typeName(d) + '`', [span(pat)]);
+        const restIdx = pat.elems.findIndex((e) => e.pk === 'rest' || (e.pk === 'bind' && e.sub && e.sub.pk === 'rest'));
+        if (restIdx < 0) { if (pat.elems.length !== d.items.length) return false; return pat.elems.every((e, i) => matchPat(e, d.items[i], itemPlace(d.items, i), env, m, binds)); }
+        const before = pat.elems.slice(0, restIdx), after = pat.elems.slice(restIdx + 1);
+        if (d.items.length < before.length + after.length) return false;
+        for (let i = 0; i < before.length; i++) if (!matchPat(before[i], d.items[i], itemPlace(d.items, i), env, m, binds)) return false;
+        for (let i = 0; i < after.length; i++) { const j = d.items.length - after.length + i; if (!matchPat(after[i], d.items[j], itemPlace(d.items, j), env, m, binds)) return false; }
+        const rp = pat.elems[restIdx];
+        if (rp.pk === 'bind') { const sl = mkVec(d.items.slice(before.length, d.items.length - after.length), 'slice'); binds.push({ pat: rp, val: m === 'move' ? sl : mkRef(tempPlace(sl), m === 'refmut') }); }
+        return true;
+      }
+      case 'path': {
+        const [d] = autoDeref(v, place, mode);
+        const vm = variantMatches(pat.segs, d);
+        if (vm !== null) return vm;
+        const pv = globalValue(pat.segs, pat, env, null);
+        if (pv.k === 'enum' && d.k === 'enum') return pv.en === d.en && pv.variant === d.variant;
+        return valEq(d, pv, pat);
+      }
+      case 'tstruct': {
+        const [d, , m] = autoDeref(v, place, mode);
+        if (d.k === 'enum') {
+          const last = pat.segs[pat.segs.length - 1];
+          const vm = variantMatches(pat.segs, d);
+          if (!vm) {
+            if (vm === null && !['Some', 'None', 'Ok', 'Err'].includes(last)) throw cerr('E0308', 'mismatched types', [span(pat, 'expected `' + typeName(d) + '`, found `' + pat.segs.join('::') + '`')]);
+            return false;
+          }
+          return matchSeq(pat.elems, d.vals, env, m, binds, pat);
+        }
+        if (d.k === 'struct') {
+          if (d.name !== pat.segs[pat.segs.length - 1] && pat.segs[0] !== 'Self') return false;
+          const def = structs.get(d.name);
+          return matchSeq(pat.elems, def.fields.map((f) => d.fields[f.name]), env, m, binds, pat, d);
+        }
+        throw cerr('E0308', 'mismatched types', [span(pat, 'expected `' + typeName(d) + '`, found `' + pat.segs.join('::') + '`')], d.k === 'int' || d.k === 'str' ? [] : []);
+      }
+      case 'struct': {
+        const [d, , m] = autoDeref(v, place, mode);
+        let fields;
+        if (d.k === 'enum') { if (!variantMatches(pat.segs, d)) return false; fields = d.fields || {}; }
+        else if (d.k === 'struct') { const nm = pat.segs[pat.segs.length - 1]; if (nm !== 'Self' && nm !== d.name) return false; fields = d.fields; }
+        else return false;
+        for (const f of pat.fields) {
+          if (!(f.name in fields)) throw cerr('E0026', '`' + (d.name || d.variant) + '` does not have a field named `' + f.name + '`', [span(f.pat)]);
+          if (!matchPat(f.pat, fields[f.name], itemPlace(fields, f.name), env, m, binds)) return false;
+        }
+        if (!pat.rest) {
+          const missing = Object.keys(fields).filter((k) => !pat.fields.some((f) => f.name === k));
+          if (missing.length) throw cerr('E0027', 'pattern does not mention field' + (missing.length > 1 ? 's ' : ' ') + missing.map((x) => '`' + x + '`').join(', '), [span(pat, 'missing field' + (missing.length > 1 ? 's ' : ' ') + missing.map((x) => '`' + x + '`').join(', '))], ['help: if you don\'t care about the other fields, add `..` at the end of the pattern']);
+        }
+        return true;
+      }
+      case 'or': {
+        for (const alt of pat.alts) { const save = binds.length; if (matchPat(alt, v, place, env, mode, binds)) return true; binds.length = save; }
+        return false;
+      }
+    }
+    return false;
+  }
+  function matchSeq(pats, vals, env, mode, binds, pat, structVal) {
+    const restIdx = pats.findIndex((e) => e.pk === 'rest');
+    if (restIdx < 0) {
+      if (pats.length !== vals.length) throw cerr('E0023', 'this pattern has ' + pats.length + ' field' + (pats.length === 1 ? '' : 's') + ', but the corresponding tuple ' + (structVal ? 'struct' : 'variant') + ' has ' + vals.length + ' field' + (vals.length === 1 ? '' : 's'), [span(pat)]);
+      for (let i = 0; i < pats.length; i++) if (!matchPat(pats[i], vals[i], structVal ? itemPlace(structVal.fields, structs.get(structVal.name).fields[i].name) : itemPlace(vals, i), env, mode, binds)) return false;
+      return true;
+    }
+    const before = pats.slice(0, restIdx), after = pats.slice(restIdx + 1);
+    for (let i = 0; i < before.length; i++) if (!matchPat(before[i], vals[i], itemPlace(vals, i), env, mode, binds)) return false;
+    for (let i = 0; i < after.length; i++) { const j = vals.length - after.length + i; if (!matchPat(after[i], vals[j], itemPlace(vals, j), env, mode, binds)) return false; }
+    return true;
+  }
+  function applyBinds(binds, env) {
+    for (const b of binds) env.vars.set(b.pat.name, { name: b.pat.name, val: b.val, mut: b.pat.mut, init: true, decl: b.pat.decl, borrows: null });
+  }
+  function checkExhaustive(n, d) {
+    if (n._exh) return; n._exh = true;
+    const hasCatchAll = (p) => p.pk === 'wild' || (p.pk === 'bind' && !p.sub) || (p.pk === 'or' && p.alts.some(hasCatchAll));
+    const unguarded = n.arms.filter((a) => !a.guard).map((a) => a.pat);
+    if (unguarded.some(hasCatchAll)) return;
+    let variants = null, en = null;
+    if (d.k === 'enum') {
+      en = d.en;
+      if (en === 'Option') variants = ['Some', 'None'];
+      else if (en === 'Result') variants = ['Ok', 'Err'];
+      else if (en === 'Ordering') variants = ['Less', 'Equal', 'Greater'];
+      else { const def = enums.get(en); if (def) variants = def.variants.map((x) => x.name); }
+    } else if (d.k === 'bool') { variants = ['true', 'false']; }
+    const covered = new Set();
+    const fullCover = (p) => {
+      // does pattern cover the whole variant (all sub patterns irrefutable)?
+      const irrefutable = (q) => q.pk === 'wild' || q.pk === 'rest' || (q.pk === 'bind' && (!q.sub || irrefutable(q.sub))) || (q.pk === 'tuple' && q.elems.every(irrefutable)) || (q.pk === 'ref' && irrefutable(q.pat));
+      if (p.pk === 'or') { p.alts.forEach(fullCover); return; }
+      if (p.pk === 'path') covered.add(p.segs[p.segs.length - 1]);
+      if (p.pk === 'bind' && p.maybePath) covered.add(p.name);
+      if (p.pk === 'tstruct' && p.elems.every(irrefutable)) covered.add(p.segs[p.segs.length - 1]);
+      if (p.pk === 'struct' && p.fields.every((f) => irrefutable(f.pat))) covered.add(p.segs[p.segs.length - 1]);
+      if (p.pk === 'lit' && p.v.k === 'bool') covered.add(String(p.v.v));
+      if (p.pk === 'ref') fullCover(p.pat);
+    };
+    unguarded.forEach(fullCover);
+    if (variants) {
+      const missing = variants.filter((x) => !covered.has(x));
+      if (!missing.length) return;
+      const show = missing.map((x) => {
+        if (d.k === 'bool') return '`' + x + '`';
+        const isStd = en === 'Option' || en === 'Result';
+        let pre = isStd ? '' : en + '::';
+        const def = enums.get(en); const vd = def && def.variants.find((y) => y.name === x);
+        let suffix = '';
+        if (isStd && x !== 'None') suffix = '(_)';
+        else if (vd && vd.kind === 'tuple') suffix = '(' + vd.fields.map(() => '_').join(', ') + ')';
+        else if (vd && vd.kind === 'named') suffix = ' { .. }';
+        return '`' + pre + x + suffix + '`';
+      });
+      throw cerr('E0004', 'non-exhaustive patterns: ' + (show.length > 3 ? show.slice(0, 3).join(', ') + ' and ' + (show.length - 3) + ' more' : show.join(show.length === 2 ? ' and ' : ', ')) + ' not covered', [span(n.e, 'pattern' + (show.length > 1 ? 's ' : ' ') + show.join(', ') + ' not covered')], ['note: `match` must handle every possible value. Add the missing arm' + (show.length > 1 ? 's' : '') + ', or a wildcard `_ => ...` arm']);
+    }
+    if (['int', 'str', 'String', 'char', 'float', 'tuple'].includes(d.k)) {
+      throw cerr('E0004', 'non-exhaustive patterns: `_` not covered', [span(n.e, 'pattern `_` not covered')], ['note: the matched value has type `' + typeName(d) + '`, which has too many possible values to list', 'help: add a wildcard arm: `_ => ...`']);
+    }
+  }
+
+  // ---- statements & expressions ----
+  function tick() {
+    if ((++steps & 16383) === 0 && Date.now() - t0 > timeLimit) throw new LimitError('time');
+  }
+  function evMove(n, env, ty) {
+    if (n.k === 'path' && n.segs.length === 1) {
+      const cell = env.lookup(n.segs[0]);
+      if (cell) {
+        const v = readVar(cell, n, 'move');
+        if (isCopy(v)) return coerceLit(copyVal(v), ty, n);
+        if (cell.partial) {
+          const f = Object.keys(cell.partial)[0];
+          throw cerr('E0382', 'use of partially moved value: `' + cell.name + '`', [{ pos: cell.partial[f].pos, end: cell.partial[f].end, text: 'value partially moved here', primary: false }, span(n, 'value used here after partial move')]);
+        }
+        markMoved(cell, n);
+        return v;
+      }
+    }
+    if (n.k === 'paren') return evMove(n.e, env, ty);
+    if (n.k === 'field' || n.k === 'index' || (n.k === 'unary' && n.op === '*')) {
+      const pl = evPlace(n, env, 'read');
+      const v = pl.get();
+      if (isCopy(v)) return copyVal(v);
+      if (pl.isSlice) return v;
+      if (pl.viaRef !== 'none' || n.k === 'index' || n.k === 'unary') {
+        const what = n.k === 'index' ? 'index of `' + typeName(deref(evPlace(n.e, env, 'peek').get())) + '`' : '`' + srcOf(n) + '` which is behind a ' + (pl.viaRef === 'mut' ? 'mutable' : 'shared') + ' reference';
+        throw cerr('E0507', 'cannot move out of ' + what, [span(n, 'move occurs because `' + srcOf(n) + '` has type `' + typeName(v) + '`, which does not implement the `Copy` trait')], ['help: consider borrowing here: `&' + srcOf(n) + '`', 'help: or clone the value: `' + srcOf(n) + '.clone()`']);
+      }
+      if (pl.fieldOf) { const c = pl.fieldOf; c.partial = c.partial || {}; c.partial[pl.field] = { pos: n.pos, end: n.end }; }
+      return v;
+    }
+    return ev(n, env, ty);
+  }
+  function coerceLit(v, ty) { return v; }
+  function evOperand(n, env, mode) {
+    if (n.k === 'path' && n.segs.length === 1) return evPath(n, env, null, mode);
+    if (n.k === 'paren') return evOperand(n.e, env, mode);
+    if (isPlaceExpr(n)) return evPlace(n, env, mode).get();
+    return ev(n, env);
+  }
+  function execLet(s, env) {
+    const env2 = new Env(env);
+    const pat = s.pat;
+    if (!s.init) {
+      if (pat.pk !== 'bind') throw cerr(null, 'destructuring `let` needs an initial value', [span(pat)]);
+      env2.vars.set(pat.name, { name: pat.name, val: UNIT, mut: pat.mut, init: false, decl: pat.decl, borrows: null, declTy: s.ty });
+      return env2;
+    }
+    if (!(pat.pk === 'bind' && !pat.sub) && isPlaceExpr(s.init) && !s.ty) {
+      const pl = evPlace(s.init, env, 'read');
+      const v0 = pl.get();
+      const binds = [];
+      if (!matchPat(pat, v0, pl, env2, 'move', binds)) {
+        if (s.els) { evBlock(s.els, env, null); throw cerr('E0308', '`else` clause of `let...else` does not diverge', [span(s.els)]); }
+        throw cerr('E0005', 'refutable pattern in local binding', [span(pat, 'pattern not covered')], ['help: use `let ... else { ... }` or `if let` to handle the non-matching case']);
+      }
+      if (binds.moves && s.init.k === 'path' && pl.cell) { pl.cell.partial = pl.cell.partial || {}; pl.cell.partial[binds.movedName] = { pos: s.init.pos, end: s.init.end }; }
+      applyBinds(binds, env2);
+      return env2;
+    }
+    const roots = borrowRoots(s.init, env);
+    let v = evMove(s.init, env, s.ty);
+    if (s.ty) v = coerce(v, s.ty, s.init);
+    if (pat.pk === 'bind' && !pat.sub) {
+      if (pat.byRef) v = mkRef(tempPlace(v), pat.mut);
+      env2.vars.set(pat.name, { name: pat.name, val: v, mut: pat.mut, init: true, decl: pat.decl, borrows: null });
+      if (pat.decl) registerBorrows(pat.decl, roots, s);
+      return env2;
+    }
+    const binds = [];
+    if (!matchPat(pat, v, tempPlace(v), env2, 'move', binds)) {
+      if (s.els) { evBlock(s.els, env, null); throw cerr('E0308', '`else` clause of `let...else` does not diverge', [span(s.els)], ['help: end the `else` block with `return`, `break`, `continue` or `panic!()`']); }
+      throw cerr('E0005', 'refutable pattern in local binding', [span(pat, 'pattern not covered')], ['help: use `let ... else { ... }` or `if let` to handle the non-matching case']);
+    }
+    applyBinds(binds, env2);
+    return env2;
+  }
+  function registerBorrows(decl, roots, s) {
+    if (decl.rt) for (const b of decl.rt) b.dead = true;
+    decl.rt = [];
+    if (!roots.length || decl.lastUse <= s.end) return;
+    for (const r of roots) {
+      const b = { kind: r.kind, created: s.end, until: decl.lastUse, realUntil: decl.lastRealUse || 0, usePos: decl.lastRealUse || null, useEnd: (decl.lastRealUse || 0) + decl.name.length, pos: r.pos, end: r.end, dead: false, holder: decl.name };
+      (r.cell.borrows = r.cell.borrows || []).push(b);
+      decl.rt.push(b);
+    }
+  }
+  function borrowRoots(n, env) {
+    switch (n.k) {
+      case 'ref': { const c = rootCellOf(n.e, env); return c ? [{ cell: c, kind: n.mut ? 'mut' : 'shared', pos: n.pos, end: n.end }] : borrowRoots(n.e, env); }
+      case 'paren': return borrowRoots(n.e, env);
+      case 'mcall': {
+        if (REF_RETURNING.has(n.name)) {
+          const c = rootCellOf(n.recv, env);
+          if (c && !(c.val && c.val.k === 'ref' && n.recv.k === 'path')) return [{ cell: c, kind: REF_RETURNING_MUT.has(n.name) ? 'mut' : 'shared', pos: n.recv.pos, end: n.end }];
+          return borrowRoots(n.recv, env);
+        }
+        if (LAZY_ADAPTORS.has(n.name)) return borrowRoots(n.recv, env);
+        if (['unwrap', 'expect', 'or_insert', 'or_default', 'or_insert_with'].includes(n.name)) return borrowRoots(n.recv, env);
+        // user method returning a reference
+        const c = rootCellOf(n.recv, env);
+        if (c && c.val) {
+          const base = deref(c.val);
+          const um = base && (base.k === 'struct' || base.k === 'enum') ? findMethod(typeKey(base), n.name) : null;
+          if (um && um.ret && containsRef(um.ret) && um.selfParam && um.selfParam.ref) return [{ cell: c, kind: um.selfParam.mut ? 'mut' : 'shared', pos: n.recv.pos, end: n.end }];
+        }
+        return [];
+      }
+      case 'call': {
+        if (n.f.k === 'path') {
+          const segs = n.f.segs;
+          if (segs.length === 1 && (segs[0] === 'Some' || segs[0] === 'Ok')) return n.args.flatMap((a) => borrowRoots(a, env));
+          const f = segs.length === 1 ? G.fns.get(segs[0]) : null;
+          if (f && f.ret && containsRef(f.ret)) return n.args.flatMap((a) => borrowRoots(a, env));
+        }
+        return [];
+      }
+      case 'structLit': return n.fields.flatMap((f) => borrowRoots(f.e, env));
+      case 'tuple': case 'array': return n.elems.flatMap((e) => borrowRoots(e, env));
+      default: return [];
+    }
+  }
+  function containsRef(ty) {
+    if (!ty) return false;
+    if (ty.tk === 'ref') return true;
+    if (ty.tk === 'path') return (ty.args || []).some(containsRef);
+    if (ty.tk === 'tuple') return ty.elems.some(containsRef);
+    if (ty.tk === 'slice' || ty.tk === 'array') return containsRef(ty.elem);
+    return false;
+  }
+  function evBlock(b, env, ty, isFnBody) {
+    let e = new Env(env);
+    const st = b.stmts; const L = st.length;
+    for (let i = 0; i < L; i++) {
+      const s = st[i];
+      if (s.k === 'item') continue;
+      if (s.k === 'let') { e = execLet(s, e); continue; }
+      if (i === L - 1 && !s.semi) { const r = evMove(s.expr, e, ty); checkOutlives(e, env, b); return r; }
+      ev(s.expr, e, s.semi ? null : undefined);
+    }
+    checkOutlives(e, env, b);
+    return UNIT;
+  }
+  function checkOutlives(e, base, b) {
+    if (!b.end) return;
+    for (let x = e; x && x !== base; x = x.parent) {
+      for (const cell of x.vars.values()) {
+        if (!cell.borrows) continue;
+        for (const br of cell.borrows) {
+          if (br.dead || br.loop || !br.realUntil || br.realUntil <= b.end || br.created >= b.end) continue;
+          const labels = [];
+          if (cell.decl) labels.push({ pos: cell.decl.pos, end: cell.decl.end, text: 'binding `' + cell.name + '` declared here', primary: false });
+          labels.push({ pos: br.pos, end: br.end, text: 'borrowed value does not live long enough', primary: true });
+          labels.push({ pos: b.end - 1, end: b.end, text: '`' + cell.name + '` dropped here while still borrowed', primary: false });
+          if (br.usePos) labels.push({ pos: br.usePos, end: br.useEnd, text: 'borrow later used here', primary: false });
+          throw cerr('E0597', '`' + cell.name + '` does not live long enough', labels, ['note: `' + cell.name + '` is freed at the end of its block, but `' + (br.holder || 'the reference') + '` is still used after that. Move the use inside the block, or declare `' + cell.name + '` in the outer scope']);
+        }
+      }
+    }
+  }
+  function ev(n, env, ty) {
+    if ((++steps & 16383) === 0 && Date.now() - t0 > timeLimit) throw new LimitError('time');
+    switch (n.k) {
+      case 'int': {
+        let t = n.suffix || null;
+        if (!t && ty) { const r = resolveTy(ty); if (r && r.tk === 'path' && INT_BITS[r.name]) t = r.name; }
+        const v = mkInt(n.v, t);
+        if (t) { const [lo, hi] = intRange(t); if (n.v > hi || n.v < lo) { if (!(t[0] === 'i' && n.v === hi + 1n)) throw cerr(null, 'literal out of range for `' + t + '`', [span(n, 'the literal `' + srcOf(n) + '` does not fit into the type `' + t + '` whose range is `' + lo + '..=' + hi + '`')]); } }
+        else if (n.v > 2147483647n) {
+          const [lo, hi] = intRange('i64'); if (n.v > hi) throw cerr(null, 'literal out of range for `i64`', [span(n)]);
+        }
+        return v;
+      }
+      case 'float': return mkFloat(n.v, n.suffix || (ty && ty.tk === 'path' && (ty.name === 'f32' || ty.name === 'f64') ? ty.name : null));
+      case 'str': if (n.bytes) return mkRef(tempPlace(mkVec(Array.from(new TextEncoder().encode(n.v)).map((b) => mkInt(BigInt(b), 'u8')), 'array')), false); return mkStr(n.v);
+      case 'char': return mkChar(n.v);
+      case 'bool': return mkBool(n.v);
+      case 'path': return evPath(n, env, ty, 'read');
+      case 'paren': return ev(n.e, env, ty);
+      case 'block': {
+        if (n.label) { try { return evBlock(n, env, ty); } catch (e) { if (e instanceof BreakSig && e.label === n.label) return e.val || UNIT; throw e; } }
+        return evBlock(n, env, ty);
+      }
+      case 'tuple': {
+        const tys = ty && ty.tk === 'tuple' ? ty.elems : [];
+        return mkTuple(n.elems.map((e, i) => evMove(e, env, tys[i])));
+      }
+      case 'array': {
+        const et = ty && (ty.tk === 'array' || ty.tk === 'slice') ? ty.elem : null;
+        const items = n.elems.map((e) => evMove(e, env, et));
+        unifyInts(items, n);
+        return mkVec(items, 'array');
+      }
+      case 'arrayRep': {
+        const v = evMove(n.e, env, ty && ty.elem);
+        const k = Number(deref(ev(n.n, env)).v);
+        if (!isCopy(v) && k > 1) throw cerr('E0277', 'the trait bound `' + typeName(v) + ': Copy` is not satisfied', [span(n.e, 'the trait `Copy` is not implemented for `' + typeName(v) + '`')], ['note: the `[x; N]` form copies `x`. Use `vec![x; N]` (which clones) instead']);
+        const items = []; for (let i = 0; i < k; i++) items.push(copyVal(v));
+        return mkVec(items, 'array');
+      }
+      case 'unary': {
+        if (n.op === '*') {
+          const v = ev(n.e, env);
+          if (v.k === 'ref') { const t = v.place.get(); return t; }
+          if (v.k === 'rc') return v.cell.val;
+          if (v.k === 'cell') return v.place.val;
+          throw cerr('E0614', 'type `' + typeName(v) + '` cannot be dereferenced', [span(n, 'can\'t be dereferenced')]);
+        }
+        const v = deref(ev(n.e, env, ty));
+        if (n.op === '-') {
+          if (v.k === 'int') {
+            if (v.ty && v.ty[0] === 'u') throw cerr('E0600', 'cannot apply unary operator `-` to type `' + v.ty + '`', [span(n, 'cannot apply unary operator `-`')], ['note: unsigned values cannot be negated']);
+            if (v.ty) { const [lo] = intRange(v.ty); if (v.v === lo) panic('attempt to negate with overflow', n); }
+            return mkInt(-v.v, v.ty);
+          }
+          if (v.k === 'float') return mkFloat(-v.v, v.ty);
+          if (v.k === 'struct') { const m = findTraitMethod(v.name, 'Neg', 'neg'); if (m) return callFn(m, [], v, v.name, n); }
+          throw cerr('E0600', 'cannot apply unary operator `-` to type `' + typeName(v) + '`', [span(n)]);
+        }
+        if (n.op === '!') {
+          if (v.k === 'bool') return mkBool(!v.v);
+          if (v.k === 'int') return mkInt(wrapInt(~v.v, v.ty || 'i32'), v.ty);
+          if (v.k === 'struct') { const m = findTraitMethod(v.name, 'Not', 'not'); if (m) return callFn(m, [], v, v.name, n); }
+          throw cerr('E0600', 'cannot apply unary operator `!` to type `' + typeName(v) + '`', [span(n)]);
+        }
+        break;
+      }
+      case 'ref': {
+        if (n.mut) {
+          if (isPlaceExpr(n.e)) {
+            const pl = evPlace(n.e, env, 'peek');
+            requireMut(pl, n, n.e);
+            const root = rootCellOf(n.e, env); if (root) checkBorrows(root, n, 'mutborrow');
+            return mkRef(pl, true);
+          }
+          return mkRef(tempPlace(ev(n.e, env)), true);
+        }
+        if (isPlaceExpr(n.e)) {
+          const pl = evPlace(n.e, env, 'peek');
+          const root = rootCellOf(n.e, env); if (root) checkBorrows(root, n, 'borrow');
+          const v = pl.get();
+          if (pl.isSlice) return v.k === 'str' ? v : mkRef(tempPlace(v), false);
+          if (v.k === 'str' && n.e.k !== 'index') return mkRef(pl, false);
+          return mkRef(pl, false);
+        }
+        const v = ev(n.e, env, ty && ty.tk === 'ref' ? ty.inner : null);
+        if (v.k === 'str') return v;
+        return mkRef(tempPlace(v), false);
+      }
+      case 'cast': return castVal(ev(n.e, env), n.ty, n);
+      case 'bin': return evBin(n, env, ty);
+      case 'assign': return evAssign(n, env);
+      case 'range': {
+        let lo = n.lo ? deref(ev(n.lo, env)) : null, hi = n.hi ? deref(ev(n.hi, env)) : null;
+        if (lo && hi && lo.k === 'int' && hi.k === 'int') {
+          if (lo.ty && hi.ty && lo.ty !== hi.ty) throw mismatch(lo.ty, '`' + hi.ty + '`', n.hi);
+          const t = lo.ty || hi.ty; if (t) { lo = mkInt(lo.v, t); hi = mkInt(hi.v, t); }
+        }
+        return { k: 'range', lo, hi, incl: n.incl };
+      }
+      case 'call': return evCall(n, env, ty);
+      case 'mcall': {
+        let hint = ty;
+        if (['unwrap', 'expect', 'unwrap_or', 'unwrap_or_default', 'unwrap_or_else'].includes(n.name)) {
+          const v = evMethodCallWithHint(n, env, ty);
+          return v;
+        }
+        const r = evMethodCall(n, env, hint);
+        if (r && r.k === 'entry') return r;
+        return r;
+      }
+      case 'field': {
+        const pl = evPlace(n, env, 'read');
+        return pl.get();
+      }
+      case 'index': return evPlace(n, env, 'read').get();
+      case 'try': {
+        const v0 = ev(n.e, env, ty ? { tk: 'path', name: 'Result', args: [ty] } : null);
+        const v = derefRefs(v0);
+        if (v.k !== 'enum' || (v.en !== 'Option' && v.en !== 'Result')) throw cerr('E0277', 'the `?` operator can only be applied to values that implement `Try`', [span(n, 'the `?` operator cannot be applied to type `' + typeName(v) + '`')], ['note: `?` works on `Result` and `Option` values']);
+        const fd = env.fnDecl;
+        const fret = fd && fd.ret ? resolveTy(fd.ret) : null;
+        if (fd && !env.inClosure) {
+          const fname = fret && fret.tk === 'path' ? fret.name : '()';
+          if (fname !== 'Result' && fname !== 'Option' && !typeAliases.has(fname)) {
+            throw cerr('E0277', 'the `?` operator can only be used in a function that returns `Result` or `Option`', [{ pos: n.opPos, end: n.opPos + 1, text: 'cannot use the `?` operator in a function that returns `' + (fd.ret ? tyText(fd.ret) : '()') + '`', primary: true }, { pos: fd.namePos, end: fd.nameEnd, text: 'this function should return `Result` or `Option` to accept `?`', primary: false }], fd.name === 'main' ? ['help: change the signature to `fn main() -> Result<(), Box<dyn std::error::Error>>` and end `main` with `Ok(())`'] : []);
+          }
+        }
+        if (v.variant === 'Some' || v.variant === 'Ok') return v.vals[0];
+        if (v.variant === 'None') throw new ReturnSig(mkNone());
+        let e = v.vals[0];
+        if (fret && fret.tk === 'path' && fret.name === 'Result' && fret.args && fret.args[1] && !env.inClosure) {
+          const et = resolveTy(fret.args[1]);
+          if (et.tk === 'path' && (structs.has(et.name) || enums.has(et.name)) && typeKey(deref(e)) !== et.name) {
+            const fi = impls.get(et.name) && impls.get(et.name).traitImpls.find((t) => t.trait === 'From' && (!t.arg || t.arg === typeKey(deref(e))));
+            if (!fi) throw cerr('E0277', '`?` couldn\'t convert the error to `' + et.name + '`', [span(n, 'the trait `From<' + typeName(deref(e)) + '>` is not implemented for `' + et.name + '`')], ['note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait', 'help: add `impl From<' + typeName(deref(e)) + '> for ' + et.name + '`, or convert with `.map_err(...)`']);
+            e = callFn(fi.methods.get('from'), [e], undefined, et.name, n);
+          } else if (et.tk === 'path' && et.name === 'String' && deref(e).k === 'str') e = mkString(deref(e).v);
+        }
+        throw new ReturnSig(mkErr(e));
+      }
+      case 'structLit': return evStructLit(n, env);
+      case 'if': {
+        if (n.cond.k === 'letcond') {
+          const e2 = new Env(env);
+          if (matchScrutinee(n.cond.pat, n.cond.e, env, e2, n.cond)) return evBlock(n.then, e2, ty);
+        } else if (truthy(ev(n.cond, env), n.cond)) return evBlock(n.then, env, ty);
+        if (n.els) return n.els.k === 'if' ? ev(n.els, env, ty) : evBlock(n.els, env, ty);
+        return UNIT;
+      }
+      case 'match': {
+        const scrut = n.e;
+        let pl, root = null;
+        if (isPlaceExpr(scrut)) { pl = evPlace(scrut, env, 'read'); root = scrut.k === 'path' ? pl.cell : null; }
+        else pl = tempPlace(ev(scrut, env));
+        const v = pl.get();
+        checkExhaustive(n, deref(v));
+        for (const arm of n.arms) {
+          const e2 = new Env(env);
+          const binds = [];
+          if (!matchPat(arm.pat, v, pl, e2, 'move', binds)) continue;
+          if (binds.moves && isPlaceExpr(scrut)) {
+            if (pl.viaRef && pl.viaRef !== 'none') throw cerr('E0507', 'cannot move out of `' + srcOf(scrut) + '` as enum variant which is behind a ' + (pl.viaRef === 'mut' ? 'mutable' : 'shared') + ' reference', [span(scrut), span(arm.pat, 'data moved here', false)], ['help: consider borrowing here: `match &' + srcOf(scrut) + '`']);
+          }
+          applyBinds(binds, e2);
+          if (arm.guard && !truthy(ev(arm.guard, e2), arm.guard)) continue;
+          if (binds.moves && root) markMoved(root, arm.pat, 'value moved here');
+          return evMove(arm.body, e2, ty);
+        }
+        panic('internal error: entered unreachable code (no match arm matched)', n);
+        break;
+      }
+      case 'while': {
+        for (;;) {
+          tick();
+          const e2 = new Env(env);
+          if (n.cond.k === 'letcond') { if (!matchScrutinee(n.cond.pat, n.cond.e, env, e2, n.cond)) break; }
+          else if (!truthy(ev(n.cond, env), n.cond)) break;
+          try { evBlock(n.body, e2, null); }
+          catch (e) {
+            if (e instanceof BreakSig && (!e.label || e.label === n.label)) break;
+            if (e instanceof ContinueSig && (!e.label || e.label === n.label)) continue;
+            throw e;
+          }
+        }
+        return UNIT;
+      }
+      case 'loop': {
+        for (;;) {
+          tick();
+          try { evBlock(n.body, env, null); }
+          catch (e) {
+            if (e instanceof BreakSig && (!e.label || e.label === n.label)) return e.val || UNIT;
+            if (e instanceof ContinueSig && (!e.label || e.label === n.label)) continue;
+            throw e;
+          }
+        }
+      }
+      case 'for': {
+        const loopRoots = borrowRoots(n.iter, env);
+        const iv = evMove(n.iter, env, null);
+        const it = toIter(iv, n.iter);
+        const loopBorrows = loopRoots.map((r) => { const b = { kind: r.kind, created: n.iter.end, until: n.end, usePos: n.iter.pos, useEnd: n.iter.end, pos: r.pos, end: r.end, dead: false, loop: true }; (r.cell.borrows = r.cell.borrows || []).push(b); return b; });
+        try {
+        const simple = n.pat.pk === 'bind' && !n.pat.sub;
+        for (;;) {
+          tick();
+          const x = it.next();
+          if (x === DONE) break;
+          const e2 = new Env(env);
+          if (simple) e2.vars.set(n.pat.name, { name: n.pat.name, val: isCopy(x) ? copyVal(x) : x, mut: n.pat.mut, init: true, decl: n.pat.decl, borrows: null });
+          else { const binds = []; if (!matchPat(n.pat, x, tempPlace(x), e2, 'move', binds)) throw cerr('E0005', 'refutable pattern in `for` loop binding', [span(n.pat)]); applyBinds(binds, e2); }
+          try { evBlock(n.body, e2, null); }
+          catch (e) {
+            if (e instanceof BreakSig && (!e.label || e.label === n.label)) break;
+            if (e instanceof ContinueSig && (!e.label || e.label === n.label)) continue;
+            throw e;
+          }
+        }
+        } finally { for (const b of loopBorrows) b.dead = true; }
+        return UNIT;
+      }
+      case 'break': throw new BreakSig(n.label, n.e ? evMove(n.e, env) : null);
+      case 'continue': throw new ContinueSig(n.label);
+      case 'return': {
+        const fd = env.fnDecl;
+        const v = n.e ? evMove(n.e, env, fd && !env.inClosure ? fd.ret : null) : UNIT;
+        throw new ReturnSig(v);
+      }
+      case 'closure': {
+        let cenv = env;
+        if (n.move) {
+          cenv = new Env(env);
+          for (const nm of n.captures) {
+            const c = env.lookup(nm);
+            if (!c) continue;
+            if (c.moved) throw movedError(c, n, 'use');
+            const nv = isCopy(c.val) ? copyVal(c.val) : c.val;
+            cenv.vars.set(nm, { name: nm, val: nv, mut: c.mut, init: true, decl: c.decl, borrows: null });
+            if (!isCopy(c.val)) markMoved(c, { pos: n.pos, end: n.pos + 4 }, 'value moved into closure here', 'note: `move` closures take ownership of the variables they use. Clone `' + nm + '` before the closure if you still need it (for `Arc`, use `Arc::clone(&' + nm + ')`)');
+          }
+        }
+        const ce = new Env(cenv); ce.inClosure = true;
+        return { k: 'closure', node: n, env: ce };
+      }
+      case 'macro': return evMacro(n, env, ty);
+      case 'letcond': throw cerr(null, '`let` expressions are only supported directly in `if` and `while` conditions', [span(n)]);
+    }
+    throw cerr(null, 'unsupported expression: ' + n.k, [span(n)]);
+  }
+  function evMethodCallWithHint(n, env, ty) {
+    // propagate the expected type into the receiver for parse()/collect()/sum()
+    const recv = n.recv;
+    const wrap = ty ? ty : null;
+    if (recv.k === 'mcall' && ['parse', 'collect', 'sum', 'product', 'into'].includes(recv.name) && !recv.turbofish && wrap) {
+      const orig = recv;
+      const inner = evMethodCall(orig, env, wrap);
+      const pl = tempPlace(inner);
+      return methodDispatch(pl, n.name, n, env, ty, null, null, null);
+    }
+    return evMethodCall(n, env, ty);
+  }
+  function unifyInts(items, n) {
+    let t = null;
+    for (const x of items) if (x.k === 'int' && x.ty) { if (t && t !== x.ty) throw mismatch(t, '`' + x.ty + '`', n); t = x.ty; }
+    if (t) for (let i = 0; i < items.length; i++) if (items[i].k === 'int' && !items[i].ty) items[i] = mkInt(items[i].v, t);
+    let kinds = new Set(items.map((x) => x.k === 'ref' ? 'ref' : x.k));
+    if (kinds.has('int') && kinds.has('float')) { const bad = items.find((x) => x.k !== items[0].k); throw mismatch(typeName(items[0]), foundDesc(bad), n, 'note: every element of an array or Vec must have the same type'); }
+    if (kinds.has('str') && kinds.has('String')) throw mismatch('&str', '`String`', n, 'note: every element of an array or Vec must have the same type');
+  }
+  function matchScrutinee(pat, scrut, env, e2, condNode) {
+    let pl, root = null;
+    if (isPlaceExpr(scrut)) { pl = evPlace(scrut, env, 'read'); root = scrut.k === 'path' ? pl.cell : null; }
+    else pl = tempPlace(ev(scrut, env));
+    const v = pl.get();
+    const binds = [];
+    if (!matchPat(pat, v, pl, e2, 'move', binds)) return false;
+    if (binds.moves && isPlaceExpr(scrut) && pl.viaRef && pl.viaRef !== 'none') throw cerr('E0507', 'cannot move out of `' + srcOf(scrut) + '` which is behind a ' + (pl.viaRef === 'mut' ? 'mutable' : 'shared') + ' reference', [span(scrut)], ['help: consider borrowing here: `&' + srcOf(scrut) + '`']);
+    if (binds.moves && root) markMoved(root, pat, 'value moved here');
+    applyBinds(binds, e2);
+    return true;
+  }
+  function evBin(n, env, ty) {
+    const op = n.op;
+    if (op === '&&') { if (!truthy(ev(n.l, env), n.l)) return FALSE; return mkBool(truthy(ev(n.r, env), n.r)); }
+    if (op === '||') { if (truthy(ev(n.l, env), n.l)) return TRUE; return mkBool(truthy(ev(n.r, env), n.r)); }
+    if (op === '==' || op === '!=' || op === '<' || op === '>' || op === '<=' || op === '>=') {
+      const l = evOperand(n.l, env, 'borrow'), r = evOperand(n.r, env, 'borrow');
+      checkRefLevels(l, r, n);
+      if (op === '==') return mkBool(valEq(l, r, n));
+      if (op === '!=') return mkBool(!valEq(l, r, n));
+      const c = cmpVals(l, r, n);
+      if (Number.isNaN(c)) return FALSE;
+      return mkBool(op === '<' ? c < 0 : op === '>' ? c > 0 : op === '<=' ? c <= 0 : c >= 0);
+    }
+    const lhsTy = ty && ty.tk === 'path' && (INT_BITS[ty.name] || ty.name === 'f64' || ty.name === 'f32') ? ty : null;
+    const l = op === '+' ? evMove(n.l, env, lhsTy) : ev(n.l, env, lhsTy);
+    let rty = null; const ld = deref(l);
+    if (ld.k === 'int' && ld.ty && op !== '<<' && op !== '>>') rty = { tk: 'path', name: ld.ty }; else if (ld.k === 'float' && ld.ty) rty = { tk: 'path', name: ld.ty };
+    const r = (ld.k === 'struct' || ld.k === 'enum') ? evMove(n.r, env, rty) : ev(n.r, env, rty);
+    let res = binop(op, l, r, n);
+    if (res.k === 'int' && !res.ty && ld.k === 'int' && !ld.ty) {
+      const rd = deref(r); if (rd.ty) res = mkInt(res.v, rd.ty);
+    }
+    return res;
+  }
+  function checkRefLevels(l, r, n) {
+    // comparing &i32 with i32 is an error in Rust: x == &5 vs x == 5
+    const lr = l.k === 'ref', rr = r.k === 'ref';
+    if (lr !== rr) {
+      const a = lr ? deref(l) : l, b = rr ? deref(r) : r;
+      if (['int', 'float', 'char', 'bool'].includes(a.k) && ['int', 'float', 'char', 'bool'].includes(b.k)) {
+        throw cerr('E0277', 'can\'t compare `' + typeName(l) + '` with `' + typeName(r) + '`', [span(n, 'no implementation for `' + typeName(l) + ' == ' + typeName(r) + '`')], ['help: dereference the reference so both sides have the same type, for example `*' + srcOf(lr ? n.l : n.r) + '`']);
+      }
+    }
+  }
+  function evAssign(n, env) {
+    const op = n.op;
+    const lhs = n.l;
+    if (lhs.k === 'path' && lhs.segs.length === 1) {
+      const cell = env.lookup(lhs.segs[0]);
+      if (!cell) {
+        if (constCells.has(lhs.segs[0]) || G.consts.has(lhs.segs[0])) {
+          const c = G.consts.get(lhs.segs[0]);
+          if (c.kind === 'const') throw cerr('E0070', 'invalid left-hand side of assignment', [span(lhs, 'cannot assign to this expression')], ['note: `const` values are inlined and can never change. Use a `let mut` variable']);
+          constValue(lhs.segs[0], c); const cc = constCells.get(lhs.segs[0]);
+          const rv = evMove(n.r, env); cc.val = op === '=' ? rv : arith(op.slice(0, -1), cc.val, rv, n); return UNIT;
+        }
+        throw cerr('E0425', 'cannot find value `' + lhs.segs[0] + '` in this scope', [span(lhs)]);
+      }
+      if (op === '=') {
+        if (!cell.init) {
+          const aroots = borrowRoots(n.r, env);
+          const v = coerce(evMove(n.r, env, cell.declTy), cell.declTy, n.r);
+          if (cell.decl && aroots.length) registerBorrows(cell.decl, aroots, n);
+          cell.val = v; cell.init = true; cell.moved = null; cell.assignedOnce = { pos: n.pos, end: n.end };
+          return UNIT;
+        }
+        if (!cell.mut) throw immutableAssign(cell, n);
+        checkBorrows(cell, lhs, 'write');
+        const old = cell.val;
+        const aroots = borrowRoots(n.r, env);
+        const v = evMove(n.r, env, null);
+        if (cell.decl && aroots.length) registerBorrows(cell.decl, aroots, n);
+        cell.val = assignCoerce(old, v, n.r); cell.moved = null; cell.partial = null;
+        return UNIT;
+      }
+      if (!cell.mut) throw immutableAssign(cell, n);
+      readVar(cell, lhs, 'peek');
+      checkBorrows(cell, lhs, 'write');
+      const cur = cell.val;
+      const rv = ev(n.r, env, cur.k === 'int' && cur.ty ? { tk: 'path', name: cur.ty } : null);
+      cell.val = compound(op, cur, rv, n, { get: () => cell.val, set: (x) => { cell.val = x; } });
+      return UNIT;
+    }
+    const pl = evPlace(lhs, env, 'peek');
+    if (!pl.mutable) {
+      if (pl.viaRef === 'shared') throw cerr('E0594', 'cannot assign to `' + srcOf(lhs) + '`, which is behind a `&` reference', [span(lhs, '`' + (pl.refName || srcOf(lhs)) + '` is a `&` reference, so the data it refers to cannot be written')], ['help: take a mutable reference instead: `&mut`']);
+      const root = pl.root;
+      throw cerr('E0594', 'cannot assign to `' + srcOf(lhs) + '`, as `' + (root ? root.name : srcOf(lhs)) + '` is not declared as mutable', [root && root.decl ? { pos: root.decl.pos, end: root.decl.end, text: 'help: consider changing this to be mutable: `mut ' + root.name + '`', primary: false } : null, span(lhs, 'cannot assign')].filter(Boolean));
+    }
+    const root = rootCellOf(lhs, env);
+    if (root && pl.viaRef === 'none') checkBorrows(root, lhs, 'write');
+    if (op === '=') { const old = pl.get(); const v = evMove(n.r, env, null); pl.set(assignCoerce(old, v, n.r)); if (pl.fieldOf && pl.fieldOf.partial) delete pl.fieldOf.partial[pl.field]; return UNIT; }
+    const cur = pl.get();
+    const rv = ev(n.r, env, cur.k === 'int' && cur.ty ? { tk: 'path', name: cur.ty } : null);
+    pl.set(compound(op, cur, rv, n, pl));
+    return UNIT;
+  }
+  function assignCoerce(old, v, n) {
+    if (!old) return v;
+    if (old.k === 'int' && v.k === 'int') { if (old.ty && v.ty && old.ty !== v.ty) throw mismatch(old.ty, '`' + v.ty + '`', n); if (old.ty && !v.ty) return coerce(v, { tk: 'path', name: old.ty }, n); }
+    if (old.k === 'float' && v.k === 'int') throw mismatch(old.ty || 'f64', 'integer', n);
+    if (old.k === 'int' && v.k === 'float') throw mismatch(old.ty || 'i32', 'floating-point number', n);
+    if (old.k === 'String' && v.k === 'str') throw mismatch('String', '`&str`', n, 'help: try using a conversion method: `.to_string()`');
+    if (old.k === 'str' && v.k === 'String') throw mismatch('&str', '`String`', n, 'help: consider borrowing here: `&' + srcOf(n) + '`');
+    if (['int', 'float', 'bool', 'char', 'String', 'str'].includes(old.k) && ['int', 'float', 'bool', 'char', 'String', 'str'].includes(v.k) && old.k !== v.k) throw mismatch(typeName(old), foundDesc(v), n);
+    return v;
+  }
+  function immutableAssign(cell, n) {
+    const labels = [];
+    if (cell.decl) labels.push({ pos: cell.decl.pos, end: cell.decl.end, text: cell.assignedOnce ? 'help: consider making this binding mutable: `mut ' + cell.name + '`' : 'first assignment to `' + cell.name + '`', primary: false });
+    labels.push(span(n, 'cannot assign twice to immutable variable'));
+    return cerr('E0384', 'cannot assign twice to immutable variable `' + cell.name + '`', labels, ['help: consider making this binding mutable: `mut ' + cell.name + '`', 'note: variables in Rust are immutable by default. Add `mut` when you intend to change one']);
+  }
+  function compound(op, cur, rv, n, pl) {
+    const bop = op.slice(0, -1);
+    const d = derefRefs(cur);
+    if (bop === '+' && d.k === 'String') {
+      const r = deref(rv);
+      if (rv.k === 'String') throw mismatch('&str', '`String`', n.r, 'help: consider borrowing here: `&' + srcOf(n.r) + '`');
+      if (r.k !== 'str' && r.k !== 'String') throw mismatch('&str', foundDesc(r), n.r);
+      d.v += r.v; return cur;
+    }
+    if (d.k === 'struct') {
+      const tr = { '+': 'add_assign', '-': 'sub_assign', '*': 'mul_assign', '/': 'div_assign' }[bop];
+      const trn = { '+': 'AddAssign', '-': 'SubAssign', '*': 'MulAssign', '/': 'DivAssign' }[bop];
+      const m = tr && findTraitMethod(d.name, trn, tr);
+      if (m) { callFn(m, [rv], mkRef(pl, true), d.name, n); return pl.get(); }
+    }
+    if (cur.k === 'ref') throw cerr('E0368', 'binary assignment operation `' + op + '` cannot be applied to type `' + typeName(cur) + '`', [span(n.l, 'cannot use `' + op + '` on type `' + typeName(cur) + '`')], ['help: `' + srcOf(n.l) + '` is a reference. Dereference it to change the value it points to: `*' + srcOf(n.l) + ' ' + op + ' ...`']);
+    const r = binop(bop, cur, rv, n);
+    if (cur.k === 'int' && r.k === 'int' && cur.ty && !r.ty) return mkInt(r.v, cur.ty);
+    return r;
+  }
+  function evStructLit(n, env) {
+    let segs = n.segs.slice();
+    if (segs[0] === 'Self' && env.selfType) segs = [env.selfType].concat(segs.slice(1));
+    segs = stripStd(segs);
+    const last = segs[segs.length - 1];
+    let fieldsDef, name, variant = null, enName = null;
+    const sd = structs.get(segs.length === 1 ? (G.aliases.has(last) ? G.aliases.get(last).slice(-1)[0] : last) : last);
+    if (segs.length >= 2 && enums.has(segs[segs.length - 2])) {
+      enName = segs[segs.length - 2];
+      const vd = enums.get(enName).variants.find((x) => x.name === last);
+      if (!vd) throw cerr('E0599', 'no variant named `' + last + '` found for enum `' + enName + '`', [span(n)]);
+      fieldsDef = vd.fields; variant = last; name = enName + '::' + last;
+    } else if (G.aliases.has(last) && enums.has(G.aliases.get(last).slice(-2)[0])) {
+      const p = G.aliases.get(last); enName = p[p.length - 2]; variant = p[p.length - 1];
+      fieldsDef = enums.get(enName).variants.find((x) => x.name === variant).fields; name = enName + '::' + variant;
+    } else if (sd) { fieldsDef = sd.fields; name = sd.name; }
+    else throw cerr('E0422', 'cannot find struct, variant or union type `' + segs.join('::') + '` in this scope', [span(n, 'not found in this scope')]);
+    const fields = {};
+    for (const f of n.fields) {
+      const fd = fieldsDef.find((x) => x.name === f.name);
+      if (!fd) throw cerr('E0560', (variant ? 'variant `' : 'struct `') + name + '` has no field named `' + f.name + '`', [{ pos: f.pos, end: f.pos + f.name.length, text: 'unknown field', primary: true }], ['note: available fields are: ' + fieldsDef.map((x) => '`' + x.name + '`').join(', ')]);
+      if (f.name in fields) throw cerr('E0062', 'field `' + f.name + '` specified more than once', [{ pos: f.pos, end: f.pos + f.name.length, text: 'used more than once', primary: true }]);
+      fields[f.name] = coerce(evMove(f.e, env, fd.ty), fd.ty, f.e);
+    }
+    if (n.base) {
+      const b = deref(evMove(n.base, env, { tk: 'path', name: enName || name, args: [] }));
+      for (const fd of fieldsDef) if (!(fd.name in fields)) fields[fd.name] = isCopy(b.fields[fd.name]) ? copyVal(b.fields[fd.name]) : b.fields[fd.name];
+    }
+    const missing = fieldsDef.filter((x) => !(x.name in fields)).map((x) => '`' + x.name + '`');
+    if (missing.length) throw cerr('E0063', 'missing field' + (missing.length > 1 ? 's ' : ' ') + missing.join(', ') + ' in initializer of `' + name + '`', [span({ pos: n.pos, end: n.pos + n.segs.join('::').length }, 'missing ' + missing.join(', '))]);
+    const ordered = {}; for (const fd of fieldsDef) ordered[fd.name] = fields[fd.name];
+    if (variant) return { k: 'enum', en: enName, variant, vals: [], fields: ordered };
+    return { k: 'struct', name, fields: ordered };
+  }
+  function evMacro(n, env, ty) {
+    switch (n.name) {
+      case 'println': write(runFmt(n, env) + '\n', 'out'); return UNIT;
+      case 'print': write(runFmt(n, env), 'out'); return UNIT;
+      case 'eprintln': write(runFmt(n, env) + '\n', 'err'); return UNIT;
+      case 'eprint': write(runFmt(n, env), 'err'); return UNIT;
+      case 'format': return mkString(runFmt(n, env));
+      case 'write': case 'writeln': {
+        const dest = ev(n.args[0], env);
+        const s = runFmt(n, env) + (n.name === 'writeln' ? '\n' : '');
+        const d = derefRefs(dest);
+        if (d.k === 'fmt') { d.buf.push(s); return mkOk(UNIT); }
+        if (d.k === 'String') { d.v += s; return mkOk(UNIT); }
+        if (d.k === 'stdout') { write(s, 'out'); return mkOk(UNIT); }
+        throw cerr('E0599', 'cannot write into `' + typeName(d) + '`', [span(n.args[0])]);
+      }
+      case 'panic': {
+        let msg = 'explicit panic';
+        if (n.fmt) msg = runFmt(n, env);
+        else if (n.args.length) msg = display(ev(n.args[0], env), n.args[0]);
+        throw new Panic(msg, n.pos);
+      }
+      case 'unreachable': throw new Panic('internal error: entered unreachable code' + (n.fmt ? ': ' + runFmt(n, env) : ''), n.pos);
+      case 'todo': throw new Panic('not yet implemented' + (n.fmt ? ': ' + runFmt(n, env) : ''), n.pos);
+      case 'unimplemented': throw new Panic('not implemented' + (n.fmt ? ': ' + runFmt(n, env) : ''), n.pos);
+      case 'assert': case 'debug_assert': {
+        if (!n.args.length) throw cerr(null, 'macro requires a boolean expression as an argument', [span(n)]);
+        if (!truthy(ev(n.args[0], env), n.args[0])) throw new Panic(n.fmt ? runFmt(n, env) : 'assertion failed: ' + srcOf(n.args[0]), n.pos);
+        return UNIT;
+      }
+      case 'assert_eq': case 'assert_ne': case 'debug_assert_eq': case 'debug_assert_ne': {
+        const a = evOperand(n.args[0], env, 'borrow'), b = evOperand(n.args[1], env, 'borrow');
+        const eq = valEq(a, b, n);
+        const wantEq = n.name.endsWith('eq');
+        if (eq !== wantEq) {
+          const msg = n.fmt ? ': ' + runFmt(n, env) : '';
+          throw new Panic('assertion `left ' + (wantEq ? '==' : '!=') + ' right` failed' + msg + '\n  left: ' + debug(a, false, '', n) + '\n right: ' + debug(b, false, '', n), n.pos);
+        }
+        return UNIT;
+      }
+      case 'vec': {
+        const et = ty && ty.tk === 'path' && ty.name === 'Vec' && ty.args ? ty.args[0] : null;
+        if (n.rep) {
+          const v = evMove(n.rep.e, env, et); const k = Number(deref(ev(n.rep.n, env)).v);
+          const items = []; for (let i = 0; i < k; i++) items.push(i === 0 ? v : cloneVal(v, n));
+          return mkVec(items, 'Vec');
+        }
+        const items = n.args.map((a) => evMove(a, env, et));
+        unifyInts(items, n);
+        return mkVec(items, 'Vec');
+      }
+      case 'matches': {
+        const v = ev(n.args[0], env);
+        const e2 = new Env(env); const binds = [];
+        if (!matchPat(n.pat, v, tempPlace(v), e2, 'ref', binds)) return FALSE;
+        applyBinds(binds, e2);
+        if (n.guard) return mkBool(truthy(ev(n.guard, e2), n.guard));
+        return TRUE;
+      }
+      case 'dbg': {
+        const v = n.args.length ? evMove(n.args[0], env) : UNIT;
+        const [l, c] = lineCol(n.pos);
+        write('[src/main.rs:' + l + ':' + c + ']' + (n.args.length ? ' ' + srcOf(n.args[0]) + ' = ' + debug(v, true, '', n) : '') + '\n', 'err');
+        return v;
+      }
+      case 'concat': return mkStr(n.args.map((a) => display(ev(a, env), a)).join(''));
+      case 'stringify': return mkStr(n.args.map(srcOf).join(', '));
+      case 'line': return mkInt(BigInt(lineCol(n.pos)[0]), 'u32');
+      case 'column': return mkInt(BigInt(lineCol(n.pos)[1]), 'u32');
+      case 'file': return mkStr('src/main.rs');
+    }
+    throw cerr(null, 'macro `' + n.name + '!` is not supported in the teaching interpreter', [span(n)], ['help: use the Rust Playground button to run this with the real compiler']);
+  }
+
+  // handle methods on 'entry' values (they are not in builtinMethod's switch)
+  const origBuiltin = builtinMethod;
+  builtinMethod = function (v, place, name, args, n, env, ty, info, recvNode) {
+    if (v.k === 'entry') return entryMethod(v, name, args, n);
+    return origBuiltin(v, place, name, args, n, env, ty, info, recvNode);
+  };
+
+  return {
+    runMain() {
+      const main = G.fns.get('main');
+      if (!main) throw cerr('E0601', '`main` function not found in crate `playground`', [{ pos: Math.max(0, src.length - 1), end: src.length, text: 'consider adding a `main` function to `src/main.rs`', primary: true }], ['note: every Rust program starts running at `fn main() { ... }`']);
+      if (main.params.length) throw cerr('E0580', '`main` function has wrong type', [{ pos: main.namePos, end: main.nameEnd, text: 'incorrect number of function parameters', primary: true }], ['note: read command-line arguments with `std::env::args()` instead']);
+      const r = callFn(main, [], undefined, null);
+      if (r && r.k === 'enum' && r.en === 'Result' && r.variant === 'Err') {
+        write('Error: ' + debug(r.vals[0], false, '', null) + '\n', 'err');
+        return 1;
+      }
+      return 0;
+    },
+    lineCol,
+  };
+}
