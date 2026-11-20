@@ -102,7 +102,7 @@ The app checks this repository's GitHub Releases for a new version each time it 
    ```
 
 2. In the repository's **Settings → Secrets and variables → Actions**, add two secrets: `TAURI_SIGNING_PRIVATE_KEY` (the contents of `~/.tauri/oxide-workbench.key`) and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (the password you chose).
-3. Put the public key (the contents of `~/.tauri/oxide-workbench.key.pub`) in `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`, replacing `REPLACE_WITH_UPDATER_PUBLIC_KEY`, and commit it.
+3. Put the public key (the contents of `~/.tauri/oxide-workbench.key.pub`) in `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`, and commit it. (Already done for the current key, ID `7B667B11847AD895`.)
 4. Back up the private key and its password somewhere safe. If they are lost, apps already installed cannot accept any future update, and everyone has to reinstall by hand.
 
 Because `bundle.createUpdaterArtifacts` is on, `npm run build` signs the updater files too, so a local build needs the same two values as environment variables (`TAURI_SIGNING_PRIVATE_KEY` can be the key file's path or its contents). `npm run dev` does not need them.

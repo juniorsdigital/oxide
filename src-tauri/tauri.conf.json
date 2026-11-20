@@ -41,7 +41,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "REPLACE_WITH_UPDATER_PUBLIC_KEY",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdCNjY3QjExODQ3QUQ4OTUKUldTVjJIcUVFWHRtZTFPRkxIUHNva2ZZOFg0UzVCa0RtRi94RGw3b3FUWTFYdVdzdm5vUnI1WXoK",
       "endpoints": ["https://github.com/juniorsdigital/oxide/releases/latest/download/latest.json"],
       "windows": {
         "installMode": "passive"
