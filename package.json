@@ -1,6 +1,6 @@
 {
   "name": "oxide-workbench",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Learn Rust by writing it: lessons, an editor and a real compiler in one desktop app",
   "scripts": {

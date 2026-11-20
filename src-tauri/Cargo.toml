@@ -1,6 +1,6 @@
 [package]
 name = "oxide-workbench"
-version = "0.1.0"
+version = "0.2.0"
 description = "Learn Rust by writing it: lessons, an editor and a real compiler in one desktop app"
 edition = "2021"
 rust-version = "1.77"
