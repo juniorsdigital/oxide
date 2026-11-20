@@ -47,25 +47,38 @@ function compare(name, src, stdin, expect) {
 module.exports = { compare, rustc, rl };
 if (require.main === module) {
   const { LESSONS, SANDBOX_CODE } = require('../ui/lessons.js');
+  const { checkPasses } = require('../ui/checks.js');
+  const ALTERNATIVES = require('./alternatives.js');
+  const checksFor = (L, res, src) => L.task.checks.map((c) => checkPasses(c, { kind: res.b.kind, stdout: res.b.stdout }, src));
   let fails = 0;
   const only = process.argv[2];
   for (const L of LESSONS) {
     if (only && !L.id.includes(only)) continue;
-    if (compare(L.id + ':starter', L.starter, L.stdin, L.expectStarter).ok === false) fails++;
+    const s = compare(L.id + ':starter', L.starter, L.stdin, L.expectStarter);
+    if (s.ok === false) fails++;
     const r = compare(L.id + ':solution', L.solution, L.stdin);
     if (r.ok === false) fails++;
-    // checks on solution
-    for (const c of L.task.checks) {
-      let pass;
-      const out = r.b.stdout;
-      if (c.type === 'out') pass = out.includes(c.value);
-      else if (c.type === 'ok') pass = r.b.kind === 'ok';
-      else if (c.type === 'code') pass = c.value.startsWith('re:') ? new RegExp(c.value.slice(3)).test(L.solution) : L.solution.includes(c.value);
-      else if (c.type === 'nocode') pass = !(c.value.startsWith('re:') ? new RegExp(c.value.slice(3)).test(L.solution) : L.solution.includes(c.value));
-      if (!pass) { fails++; console.log('   CHECK FAIL on solution: ' + c.label); }
+    // every check passes on the solution
+    checksFor(L, r, L.solution).forEach((pass, i) => { if (!pass) { fails++; console.log('   CHECK FAIL on solution: ' + L.task.checks[i].label); } });
+    // the starter does not already complete the task
+    if (checksFor(L, s, L.starter).every(Boolean)) { fails++; console.log('   CHECKS ALL PASS on starter: the task is already done before the learner starts'); }
+  }
+  // other correct (and incorrect) answers, so the checks accept every reasonable solution and only those
+  for (const A of ALTERNATIVES) {
+    const L = LESSONS.find((l) => l.id === A.lesson);
+    if (!L) { fails++; console.log('FAIL alternative for unknown lesson ' + A.lesson); continue; }
+    if (only && !L.id.includes(only)) continue;
+    let src = A.from === 'starter' ? L.starter : L.solution;
+    const bad = A.edit.find(([find]) => src.split(find).length !== 2);
+    if (bad) { fails++; console.log('FAIL ' + L.id + ' alternative "' + A.name + '": edit must match exactly once: ' + JSON.stringify(bad[0])); continue; }
+    for (const [find, replace] of A.edit) src = src.replace(find, () => replace);
+    const r = compare(L.id + ':alt "' + A.name + '"', src, L.stdin);
+    if (r.ok === false) fails++;
+    const res = checksFor(L, r, src);
+    if (res.every(Boolean) !== A.pass) {
+      fails++;
+      console.log('   CHECKS ' + (A.pass ? 'REJECT a correct answer: ' + L.task.checks.filter((c, i) => !res[i]).map((c) => c.label).join('; ') : 'ACCEPT a wrong answer'));
     }
-    // starter should NOT pass all checks
-    const s = r.b; void s;
   }
   if (!only) if (compare('sandbox', SANDBOX_CODE).ok === false) fails++;
   // extra test files

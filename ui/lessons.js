@@ -1,5 +1,7 @@
 // ---------- Oxide Workbench curriculum ----------
 // check types: out (stdout contains), code (source contains, regex allowed with re:), ok (ran with exit 0), nocode (source must not contain)
+// Checks are evaluated by ui/checks.js, which ignores comments. Write code checks that accept every reasonable solution,
+// and list alternative solutions in tests/alternatives.js so the harness keeps them passing.
 const MODULES = [
   { id: 'm1', num: 1, title: 'Foundations', blurb: 'Syntax, types and control flow' },
   { id: 'm2', num: 2, title: 'Ownership', blurb: 'The idea that makes Rust fast and safe' },
@@ -35,10 +37,10 @@ const LESSONS = [
 `,
     task: {
       title: 'Your turn',
-      steps: ['Run the program and read the output.', 'Add a third line that prints exactly <code>I am learning Rust.</code>', 'Use an inline placeholder, <code>{language}</code>, instead of typing the word Rust.'],
+      steps: ['Run the program and read the output.', 'Add a third line that prints exactly <code>I am learning Rust.</code>', 'Fill in the word with the <code>language</code> variable instead of typing Rust: an inline placeholder like <code>{language}</code>, or <code>{}</code> with <code>language</code> as the next argument.'],
       checks: [
         { type: 'out', value: 'I am learning Rust.', label: 'Prints “I am learning Rust.”' },
-        { type: 'code', value: '{language}', label: 'Uses the {language} placeholder' },
+        { type: 'code', value: 're:I am learning \\{language(?::[^}]*)?\\}|I am learning [^"]*\\{[^}]*\\}[^;]*\\blanguage\\b', label: 'Prints the language variable through a placeholder' },
       ],
     },
     hints: ['Copy the second <code>println!</code> line and change the text.', 'Inside the quotes, write <code>{language}</code> where the word should go: <code>println!("I am learning {language}.");</code>'],
@@ -195,7 +197,7 @@ fn main() {
       steps: ['Fix <code>square</code> so it returns a value.', 'Write <code>fn to_fahrenheit(c: f64) -> f64</code>.', 'In <code>main</code>, print <code>100°C = 212°F</code> using your function.'],
       checks: [
         { type: 'out', value: '7 squared is 49', label: 'square(7) returns 49' },
-        { type: 'code', value: 'fn to_fahrenheit', label: 'Defines to_fahrenheit' },
+        { type: 'code', value: 're:\\bfn\\s+to_fahrenheit\\b', label: 'Defines to_fahrenheit' },
         { type: 'out', value: '100°C = 212°F', label: 'Prints 100°C = 212°F' },
       ],
     },
@@ -323,7 +325,7 @@ fn takes_ownership(s: String) {
       checks: [
         { type: 'ok', label: 'Compiles and runs' },
         { type: 'out', value: 'hello again', label: 'Both greeting and moved are printed' },
-        { type: 'code', value: '.clone()', label: 'Uses .clone()' },
+        { type: 'code', value: 're:\\.clone\\(\\)|\\bclone\\(\\s*&|\\.to_owned\\(\\)|\\.to_string\\(\\)|String::from\\(\\s*&', label: 'Makes an explicit copy, such as .clone()' },
       ],
     },
     hints: ['The error points at <code>let moved = greeting;</code> as the place the value moved.', 'Write <code>let moved = greeting.clone();</code>'],
@@ -453,7 +455,7 @@ fn main() {
       title: 'Find the last word',
       steps: ['Write <code>fn last_word(s: &str) -> &str</code>.', 'Print <code>last word: abstractions</code> for the sentence.'],
       checks: [
-        { type: 'code', value: 'fn last_word', label: 'Defines last_word' },
+        { type: 'code', value: 're:\\bfn\\s+last_word\\b', label: 'Defines last_word' },
         { type: 'out', value: 'last word: abstractions', label: 'Prints the last word' },
       ],
     },
@@ -537,7 +539,7 @@ fn main() {
       title: 'Add a method',
       steps: ['Add <code>fn can_hold(&self, other: &Rectangle) -> bool</code>: true when both sides of <code>self</code> are larger than <code>other</code>.', 'Print <code>can hold: true</code> by checking whether the scaled <code>r</code> can hold <code>Rectangle::new(5, 5)</code>.'],
       checks: [
-        { type: 'code', value: 'fn can_hold', label: 'Defines can_hold' },
+        { type: 'code', value: 're:\\bfn\\s+can_hold\\b', label: 'Defines can_hold' },
         { type: 'out', value: 'can hold: true', label: 'The 6×8 rectangle holds a 5×5 one' },
       ],
     },
@@ -701,7 +703,7 @@ fn main() {
       title: 'Parse a whole list',
       steps: ['Write <code>parse_all</code> so it returns all the ports, or the first error.', 'Print <code>{:?}</code> of <code>parse_all(&amp;["80", "443"])</code> and of <code>parse_all(&amp;["80", "x"])</code>.'],
       checks: [
-        { type: 'code', value: 'fn parse_all', label: 'Defines parse_all' },
+        { type: 'code', value: 're:\\bfn\\s+parse_all\\b', label: 'Defines parse_all' },
         { type: 'out', value: 'Ok([80, 443])', label: 'Valid list gives Ok([80, 443])' },
         { type: 'out', value: 'Err(ParseIntError { kind: InvalidDigit })', label: 'Bad input gives the first error' },
       ],
@@ -844,8 +846,8 @@ fn main() {
       title: 'Build a pipeline',
       steps: ['Using <code>filter</code>, <code>map</code> and <code>sum</code>, add up the squares of the even readings.', 'Print <code>sum of squares of evens: 484</code>.'],
       checks: [
-        { type: 'code', value: '.filter(', label: 'Uses filter' },
-        { type: 'code', value: 're:\\.map\\([^)]*\\*', label: 'Uses map to square' },
+        { type: 'code', value: 're:\\.filter(_map)?\\s*\\(', label: 'Uses filter' },
+        { type: 'code', value: 're:\\.(filter_)?map\\s*\\([^;]*(\\*|\\.pow\\s*\\()', label: 'Uses map to square' },
         { type: 'out', value: 'sum of squares of evens: 484', label: 'Prints 484' },
       ],
     },
@@ -924,7 +926,7 @@ fn main() {
       title: 'Add a new shape',
       steps: ['Add <code>struct Triangle { base: f64, height: f64 }</code>.', 'Implement <code>Shape</code> for it: area is <code>0.5 * base * height</code>, name is <code>"triangle"</code>.', 'Add <code>Triangle { base: 4.0, height: 3.0 }</code> to <code>shapes</code>. The total becomes 18.14.'],
       checks: [
-        { type: 'code', value: 'impl Shape for Triangle', label: 'Implements Shape for Triangle' },
+        { type: 'code', value: 're:\\bimpl\\s+Shape\\s+for\\s+Triangle\\b', label: 'Implements Shape for Triangle' },
         { type: 'out', value: 'total area: 18.14', label: 'Total area is 18.14' },
       ],
     },
@@ -1003,7 +1005,7 @@ fn main() {
       steps: ['Read the error: the compiler cannot tell which input the result borrows from.', "Add a lifetime parameter <code>'a</code> to <code>longest</code> and use it on both inputs and the output."],
       checks: [
         { type: 'ok', label: 'Compiles and runs' },
-        { type: 'code', value: "<'a>", label: "Declares <'a>" },
+        { type: 'code', value: "re:\\bfn\\s+longest\\s*<\\s*'[A-Za-z_]\\w*", label: "Declares a lifetime such as <'a> on longest" },
         { type: 'out', value: 'longest: borrow checker', label: 'Prints the longest string' },
       ],
     },
@@ -1229,7 +1231,7 @@ fn main() {
       steps: ['Using an iterator chain, add up the squares of the multiples of 5 in <code>data</code>.', 'Print <code>multiples of 5: 67167500</code>.'],
       checks: [
         { type: 'out', value: 'multiples of 5: 67167500', label: 'Prints 67167500' },
-        { type: 'code', value: '.sum', label: 'Uses an iterator sum' },
+        { type: 'code', value: 're:\\.(sum|fold)\\b', label: 'Uses an iterator sum' },
       ],
     },
     hints: ['Copy the <code>idiomatic</code> line and change <code>3</code> to <code>5</code>.', '<code>let fives: u64 = data.iter().filter(|&amp;&amp;x| x % 5 == 0).map(|&amp;x| x * x).sum();</code>'],
@@ -1359,7 +1361,7 @@ fn main() {
       title: 'Add an INCR command',
       steps: ['Add a variant <code>Incr(String)</code> to <code>Command</code>.', 'Parse <code>INCR key</code> into it.', 'In <code>apply</code>, read the current value as an <code>i64</code> (missing counts as 0), add 1, store it back and return the new number.', 'The two <code>INCR visits</code> lines should reply <code>1</code> and then <code>2</code>.'],
       checks: [
-        { type: 'code', value: 'Incr', label: 'Adds an Incr variant' },
+        { type: 'code', value: 're:\\bIncr\\b', label: 'Adds an Incr variant' },
         { type: 'out', value: '> INCR visits\n1\n> INCR visits\n2', label: 'INCR replies 1, then 2' },
         { type: 'out', value: 'ERR unknown command: FLY away', label: 'Unknown commands still report an error' },
       ],

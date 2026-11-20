@@ -333,13 +333,7 @@
   // ---------- checks ----------
   function checkPasses(c, r, code) {
     const stdout = r && r.kind !== 'compile' ? (r.output || []).filter((o) => o.t === 'out').map((o) => o.s).join('') : '';
-    const okRun = r && r.kind === 'ok';
-    const match = (v) => (v.startsWith('re:') ? new RegExp(v.slice(3)).test(code) : code.includes(v));
-    if (c.type === 'ok') return okRun;
-    if (c.type === 'out') return okRun && stdout.includes(c.value);
-    if (c.type === 'code') return match(c.value);
-    if (c.type === 'nocode') return !match(c.value);
-    return false;
+    return window.OxideChecks.checkPasses(c, { kind: r && r.kind, stdout }, code);
   }
   let lastChecks = null;
   function evaluateChecks(r, code) {

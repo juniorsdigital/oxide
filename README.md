@@ -53,6 +53,7 @@ You can also open `ui/index.html` directly in a browser. That runs the lessons w
 
 ```
 ui/            the app's front end: index.html, styles.css, app.js, lessons.js (all lesson content)
+  checks.js    evaluates each lesson's task checks (shared with the test harness)
   rustlite.js  generated bundle of the teaching interpreter (do not edit; run npm run build:engine)
   fonts/       Archivo, IBM Plex Sans, JetBrains Mono (SIL Open Font License, see fonts/OFL.txt)
 engine/        the teaching interpreter: lexer/parser, name resolution, runtime, diagnostics
@@ -63,7 +64,7 @@ src-tauri/     desktop backend: runner.rs (compile and run with rustc), tutor.rs
 ### Tests
 
 ```bash
-npm run test:engine    # interpreter vs rustc: every lesson starter and solution, plus tests/programs
+npm run test:engine    # interpreter vs rustc: every lesson starter, solution and alternative answer, plus tests/programs
 npm run test:backend   # cargo test for the runner (needs rustc)
 ```
 
@@ -71,7 +72,7 @@ The engine test fails if the interpreter's output differs from the real program'
 
 ### Adding a lesson
 
-Lessons are plain objects in `ui/lessons.js`: `body` and `perf` are HTML, `starter` and `solution` are Rust, and `task.checks` are evaluated after each run (`out`: stdout contains, `ok`: ran with exit code 0, `code` / `nocode`: source contains or not, with a `re:` prefix for a regex). Set `expectStarter` to the error code (or `panic`) the starter should produce, and the harness checks that against `rustc`.
+Lessons are plain objects in `ui/lessons.js`: `body` and `perf` are HTML, `starter` and `solution` are Rust, and `task.checks` are evaluated after each run by `ui/checks.js` (`out`: stdout contains, `ok`: ran with exit code 0, `code` / `nocode`: source contains or not, with a `re:` prefix for a regex; comments are ignored). Write `code` checks that accept every reasonable answer, not only the text of the solution: for example, accept both `{language}` and `{}` with `language` as an argument. List other ways to solve the task, right and wrong, in `tests/alternatives.js`; the harness fails if the checks reject a correct one or accept a wrong one, or if the starter already passes every check. Set `expectStarter` to the error code (or `panic`) the starter should produce, and the harness checks that against `rustc`.
 
 ## Releases
 
