@@ -1,15 +1,24 @@
 //! Oxide Workbench desktop backend.
 //!
 //! The lessons, editor and teaching interpreter live in `ui/`. This crate adds what a
-//! browser cannot do: compile and run programs with the user's own Rust toolchain, and
-//! talk to the Claude API for the tutor without exposing the API key to the page.
+//! browser cannot do: compile and run programs with the user's own Rust toolchain, talk
+//! to the Claude API for the tutor without exposing the API key to the page, and install
+//! signed updates published on GitHub Releases.
 
 mod runner;
 mod tutor;
 
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
+    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+
+    // Updates come from this repository's GitHub Releases (see `plugins.updater` in tauri.conf.json).
+    // The page checks for them at startup and restarts the app after installing one.
+    #[cfg(desktop)]
+    let builder = builder
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init());
+
+    builder
         .manage(tutor::TutorState::default())
         .invoke_handler(tauri::generate_handler![
             runner::toolchain,

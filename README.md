@@ -84,3 +84,25 @@ git push origin v0.1.0
 ```
 
 The **Release** workflow creates a draft release with the macOS, Windows and Linux installers attached. Review it on GitHub and publish it. Keep the version in `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `package.json` in step with the tag.
+
+## Updates
+
+The app checks this repository's GitHub Releases for a new version each time it starts (and from **Settings → Check for updates**). When one exists it shows a notice with **Install and restart**. It uses the [Tauri updater](https://v2.tauri.app/plugin/updater/), which downloads `latest.json` from the latest published release and only installs files signed with the project's key.
+
+- **Updates reach users only once a release is published.** The Release workflow creates a draft; installed apps see nothing until you publish it.
+- **Bump the version for every release** in `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `package.json`. The app compares its own version with the release's, so a release with an unchanged version is never offered.
+- **Linux:** only the AppImage updates itself. People who installed the `.deb` or `.rpm` download the new package from the Releases page.
+
+### Signing key (maintainers, once)
+
+1. Generate the key pair:
+
+   ```bash
+   npm run tauri signer generate -- -w ~/.tauri/oxide-workbench.key
+   ```
+
+2. In the repository's **Settings → Secrets and variables → Actions**, add two secrets: `TAURI_SIGNING_PRIVATE_KEY` (the contents of `~/.tauri/oxide-workbench.key`) and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (the password you chose).
+3. Put the public key (the contents of `~/.tauri/oxide-workbench.key.pub`) in `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`, replacing `REPLACE_WITH_UPDATER_PUBLIC_KEY`, and commit it.
+4. Back up the private key and its password somewhere safe. If they are lost, apps already installed cannot accept any future update, and everyone has to reinstall by hand.
+
+Because `bundle.createUpdaterArtifacts` is on, `npm run build` signs the updater files too, so a local build needs the same two values as environment variables (`TAURI_SIGNING_PRIVATE_KEY` can be the key file's path or its contents). `npm run dev` does not need them.

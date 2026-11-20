@@ -653,6 +653,74 @@
     refreshKeyStatus().then(() => renderTutorIntro());
   }
 
+  // ---------- updates (desktop app only: tauri-plugin-updater, served from GitHub Releases) ----------
+  // In a plain browser window.__TAURI__ is absent, so none of this runs and the Settings section stays hidden.
+  const updater = TAURI && TAURI.updater && typeof TAURI.updater.check === 'function' ? TAURI.updater : null;
+  if (updater) {
+    let pendingUpdate = null, installing = false, checking = null;
+    const banner = $('updateBanner'), ubDetail = $('ubDetail'), ubMeter = $('ubMeter'), ubBar = $('ubBar'), ubInstall = $('ubInstall');
+    const errText = (e) => String((e && e.message) || e || 'unknown error');
+    const mb = (n) => (n / 1048576).toFixed(1) + ' MB';
+    $('updatesSection').hidden = false;
+    if (TAURI.app && TAURI.app.getVersion) {
+      TAURI.app.getVersion().then((v) => { if (!pendingUpdate) $('updateStatus').textContent = 'You have version ' + v + '. The app checks for a new version each time it starts.'; }).catch(() => {});
+    }
+    function showBanner(update) {
+      if (installing) return;
+      pendingUpdate = update;
+      $('ubTitle').textContent = 'Version ' + update.version + ' is available';
+      ubDetail.className = 'ub-detail'; ubDetail.textContent = update.currentVersion ? 'You have ' + update.currentVersion + '.' : '';
+      ubMeter.hidden = true; ubInstall.disabled = false; ubInstall.textContent = 'Install and restart';
+      banner.hidden = false;
+    }
+    // One check at a time; resolves to the Update or null, and rejects on network or signature errors.
+    function checkForUpdate() {
+      if (!checking) checking = updater.check().finally(() => { checking = null; });
+      return checking;
+    }
+    ubInstall.onclick = async () => {
+      if (!pendingUpdate || installing) return;
+      installing = true; ubInstall.disabled = true; ubInstall.textContent = 'Installing…';
+      ubDetail.className = 'ub-detail'; ubDetail.textContent = 'Downloading…';
+      ubMeter.hidden = false; ubMeter.classList.add('indeterminate'); ubBar.style.width = '';
+      let total = 0, got = 0;
+      try {
+        await pendingUpdate.downloadAndInstall((ev) => {
+          if (ev.event === 'Started') {
+            total = (ev.data && ev.data.contentLength) || 0;
+            if (total) { ubMeter.classList.remove('indeterminate'); ubBar.style.width = '0%'; }
+          } else if (ev.event === 'Progress') {
+            got += (ev.data && ev.data.chunkLength) || 0;
+            if (total) { const pct = Math.min(100, Math.round((got / total) * 100)); ubBar.style.width = pct + '%'; ubDetail.textContent = 'Downloading… ' + pct + '% of ' + mb(total); }
+            else ubDetail.textContent = 'Downloading… ' + mb(got);
+          } else if (ev.event === 'Finished') {
+            ubMeter.classList.remove('indeterminate'); ubBar.style.width = '100%'; ubDetail.textContent = 'Installing…';
+          }
+        });
+        ubDetail.textContent = 'Restarting…';
+        await TAURI.process.relaunch();
+      } catch (e) {
+        installing = false; ubInstall.disabled = false; ubInstall.textContent = 'Try again';
+        ubMeter.hidden = true; ubMeter.classList.remove('indeterminate');
+        ubDetail.className = 'ub-detail err'; ubDetail.textContent = 'The update could not be installed: ' + errText(e);
+      }
+    };
+    $('ubClose').onclick = () => { if (!installing) banner.hidden = true; };
+    $('checkUpdatesBtn').onclick = async () => {
+      const btn = $('checkUpdatesBtn'), st = $('updateStatus');
+      btn.disabled = true; st.textContent = 'Checking for updates…';
+      try {
+        const update = await checkForUpdate();
+        if (update) { st.innerHTML = '<span class="status-ok">Version ' + esc(update.version) + ' is available.</span> Install it from the notice at the bottom of the window.'; showBanner(update); }
+        else st.innerHTML = '<span class="status-ok">You\'re up to date.</span>';
+      } catch (e) {
+        st.innerHTML = '<span class="status-warn">Could not check for updates.</span> ' + esc(errText(e));
+      } finally { btn.disabled = false; }
+    };
+    // Quiet check shortly after startup: offline, no release yet or any other error simply shows nothing.
+    setTimeout(() => { checkForUpdate().then((u) => { if (u) showBanner(u); }).catch(() => {}); }, 2500);
+  }
+
   // ---------- routing ----------
   function route() {
     const id = (location.hash || '').replace(/^#/, '');

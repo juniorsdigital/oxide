@@ -2,6 +2,8 @@ name: Release
 
 # Push a tag like v0.1.0 (or run this workflow by hand) to build installers for
 # macOS (Apple silicon and Intel), Windows and Linux, attached to a draft GitHub release.
+# The updater artifacts are signed with the TAURI_SIGNING_PRIVATE_KEY secret and listed in
+# latest.json, which installed apps read once the draft release is published.
 on:
   push:
     tags: ['v*']
@@ -44,10 +46,13 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
           releaseName: 'Oxide Workbench ${{ github.ref_type == ''tag'' && github.ref_name || ''v__VERSION__'' }}'
           releaseBody: 'Installers for macOS, Windows and Linux. See the README for first-launch notes on unsigned builds.'
           releaseDraft: true
           prerelease: false
+          includeUpdaterJson: true
           args: ${{ matrix.args }}

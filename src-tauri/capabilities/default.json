@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permissions for the main window: core IPC and opening web links in the system browser.",
+  "description": "Permissions for the main window: core IPC, opening web links in the system browser, and checking for, installing and restarting into updates.",
   "windows": ["main"],
-  "permissions": ["core:default", "opener:default"]
+  "permissions": ["core:default", "opener:default", "updater:default", "process:allow-restart"]
 }
