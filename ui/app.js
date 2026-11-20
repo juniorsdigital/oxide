@@ -2,13 +2,20 @@
   'use strict';
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-  const ALL = LESSONS.concat([{ id: 'sandbox', module: null, num: '∞', title: 'Sandbox', starter: SANDBOX_CODE, sandbox: true }]);
+  // Drone Farm levels behave like lessons (saved code, checks, hints, solution) but run inside the farm simulation.
+  const FARM_LEVELS = (typeof FARM !== 'undefined' ? FARM.LEVELS : []).map((f) => ({
+    id: f.id, module: null, num: f.num, title: f.title, summary: f.summary, starter: f.starter, solution: f.solution, hints: f.hints, farm: f,
+    task: { title: 'Goal', steps: [], checks: [{ type: 'goal', label: 'Harvest ' + FARM.goalText(f) + ' within ' + f.budget + ' ticks' }].concat(f.checks) },
+  }));
+  const COURSE = LESSONS.concat([{ id: 'sandbox', module: null, num: '∞', title: 'Sandbox', starter: SANDBOX_CODE, sandbox: true }]);
+  const ALL = COURSE.concat(FARM_LEVELS);
   const byId = Object.fromEntries(ALL.map((l) => [l.id, l]));
 
   // ---------- storage (per-viewer convenience only) ----------
   const KEY = 'oxide-workbench-v1';
-  let store = { done: {}, code: {}, stdin: {}, last: 'hello', hints: {} };
+  let store = { done: {}, code: {}, stdin: {}, last: 'hello', hints: {}, farm: {} };
   try { const raw = localStorage.getItem(KEY); if (raw) store = Object.assign(store, JSON.parse(raw)); } catch (e) { /* storage unavailable */ }
+  if (!store.farm || typeof store.farm !== 'object') store.farm = {};
   let saveTimer = null;
   const save = () => { clearTimeout(saveTimer); saveTimer = setTimeout(() => { try { localStorage.setItem(KEY, JSON.stringify(store)); } catch (e) { /* ignore */ } }, 250); };
 
@@ -125,8 +132,10 @@
     clearTimeout(playTimer); playTimer = setTimeout(updatePlayLink, 300);
   }
   ta.addEventListener('input', onEdit);
+  // The program that actually runs: for a farm level, the player's code plus the farm module and main().
+  function fullProgram() { return current && current.farm ? FARM.program(current.farm, ta.value) : ta.value; }
   function updatePlayLink() {
-    $('playLink').href = 'https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&code=' + encodeURIComponent(ta.value);
+    $('playLink').href = 'https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&code=' + encodeURIComponent(fullProgram());
   }
 
   // ---------- desktop bridge (Tauri) ----------
@@ -322,11 +331,15 @@
     showTab('out');
     const code = ta.value;
     const stdin = $('stdin').value;
-    const r = await execute(code, stdin);
+    const level = current.farm, runFor = current;
+    const r = await execute(level ? FARM.program(level, code) : code, stdin);
     running = false;
     $('runBtn').disabled = false; $('runLabel').textContent = 'Run';
+    if (runFor !== current) return; // switched lessons while it ran
+    if (level) prepareFarmResult(r);
     renderResult(r);
     evaluateChecks(r, code);
+    if (level) showFarmReplay(r);
   }
   $('runBtn').addEventListener('click', runCode);
 
@@ -339,6 +352,7 @@
     if (c.type === 'out') return okRun && stdout.includes(c.value);
     if (c.type === 'code') return match(c.value);
     if (c.type === 'nocode') return !match(c.value);
+    if (c.type === 'goal') return !!(r && r.farm && r.farm.end && r.farm.end.why === 'goal');
     return false;
   }
   let lastChecks = null;
@@ -349,6 +363,11 @@
     const all = res.every(Boolean);
     const wasDone = !!store.done[current.id];
     if (all) { store.done[current.id] = true; save(); }
+    if (all && current.farm) {
+      const t = r.farm.end.tick, rec = store.farm[current.id] || {};
+      lastFarmRun = { ticks: t, newBest: !rec.best || t < rec.best };
+      if (lastFarmRun.newBest) { store.farm[current.id] = { best: t }; save(); }
+    } else lastFarmRun = null;
     renderTaskState(res, all && !wasDone);
     renderRail(); renderProgress();
   }
@@ -364,10 +383,18 @@
       }
       h += '</div>';
     }
+    if (FARM_LEVELS.length) {
+      h += '<div class="mod fm-mod"><div class="mod-head"><span class="mod-num fm-mark" aria-hidden="true"><svg width="11" height="12" viewBox="0 0 26 26"><path d="M13 1.8 22.7 7.4v11.2L13 24.2 3.3 18.6V7.4z" fill="currentColor"/></svg></span><span class="mod-title">Drone Farm</span></div><div class="mod-blurb">A programming game: steer a farm drone with Rust</div>';
+      for (const l of FARM_LEVELS) {
+        const rec = store.farm[l.id]; const par = rec && rec.best <= l.farm.par;
+        h += '<a class="lesson-link" href="#' + l.id + '"' + (current && current.id === l.id ? ' aria-current="page"' : '') + '><span class="dot' + (store.done[l.id] ? ' done' : '') + '" aria-label="' + (store.done[l.id] ? 'completed' : 'not completed') + '"></span><span class="n">' + l.num + '</span><span>' + esc(l.title) + (par ? ' <span class="par-badge" title="Finished at or under par">par</span>' : '') + '</span></a>';
+      }
+      h += '</div>';
+    }
     h += '<div class="rail-foot"><a class="lesson-link" href="#sandbox"' + (current && current.id === 'sandbox' ? ' aria-current="page"' : '') + '><span class="dot"></span><span class="n">∞</span><span>Sandbox</span></a><span id="resetProgressSlot"><button class="text-btn" id="resetProgress">Reset my progress</button></span></div>';
     rail.innerHTML = h;
     const rp = $('resetProgress');
-    if (rp) rp.onclick = () => inlineConfirm($('resetProgressSlot'), 'Clear all progress and saved code?', 'Clear', () => { store = { done: {}, code: {}, stdin: {}, last: 'hello', hints: {} }; save(); openLesson(current.id, true); }, () => renderRail());
+    if (rp) rp.onclick = () => inlineConfirm($('resetProgressSlot'), 'Clear all progress and saved code?', 'Clear', () => { store = { done: {}, code: {}, stdin: {}, last: 'hello', hints: {}, farm: {} }; save(); openLesson(current.id, true); }, () => renderRail());
   }
   function renderProgress() {
     const n = LESSONS.filter((l) => store.done[l.id]).length;
@@ -413,6 +440,7 @@
   function modOf(l) { return MODULES.find((m) => m.id === l.module); }
   function renderSheet() {
     const l = current;
+    if (l.farm) { renderFarmSheet(); return; }
     if (l.sandbox) {
       sheet.innerHTML = '<div class="sheet-inner"><div class="plate"><span>Sandbox</span><span>Free practice</span></div><h1>Sandbox</h1><p class="lede">A blank bench for your own experiments. Your code here is saved in this browser.</p><div class="prose"><p>Ideas to try:</p><ul><li>Write a function that returns the <em>n</em>th prime and time it with <code>std::time::Instant</code>.</li><li>Model a bank account with a struct, an enum of transactions and a method that applies them, returning <code>Result</code> on overdraft.</li><li>Parse <code>key=value</code> lines from the Input tab into a <code>BTreeMap</code>.</li></ul><p>Anything the teaching interpreter cannot run, the <strong>Playground</strong> button opens in the official compiler.</p></div>' + pagerHtml() + '</div>';
       bindSheet(); return;
@@ -439,6 +467,12 @@
     h += pagerHtml();
     h += '</div>';
     sheet.innerHTML = h;
+    decorateProse();
+    sheet.querySelectorAll('figure.diagram').forEach((f) => { f.innerHTML = DIAGRAMS[f.dataset.diagram] || ''; });
+    bindSheet();
+    renderTaskState(lastChecks, false);
+  }
+  function decorateProse() {
     sheet.querySelectorAll('.prose pre code').forEach((c) => { c.innerHTML = highlightInline(c.textContent); });
     sheet.querySelectorAll('.prose pre.copyable').forEach((pre) => {
       const b = document.createElement('button'); b.className = 'copy-btn'; b.textContent = 'Copy';
@@ -449,14 +483,91 @@
       };
       pre.appendChild(b);
     });
-    sheet.querySelectorAll('figure.diagram').forEach((f) => { f.innerHTML = DIAGRAMS[f.dataset.diagram] || ''; });
+  }
+
+  // ---------- Drone Farm ----------
+  let farmPlayer = null, lastFarmRun = null;
+  function renderFarmSheet() {
+    const l = current, f = l.farm;
+    const hintsShown = store.hints[l.id] || 0; const rec = store.farm[l.id];
+    let h = '<div class="sheet-inner">';
+    h += '<div class="plate"><span>Drone Farm ' + l.num + '</span><span>' + esc(f.concept) + '</span></div>';
+    h += '<h1>' + esc(l.title) + '</h1>';
+    h += '<p class="lede">' + l.summary + '</p>';
+    h += '<div class="meta">' + f.map.length + ' × ' + f.map.length + ' field · ' + f.budget + ' ticks · par ' + f.par + (rec ? ' · your best ' + rec.best : '') + '</div>';
+    h += FARM.playerHtml(f);
+    h += '<section class="task" id="task"><div class="task-head"><h2>Goal</h2><span class="state-pill" id="taskPill"></span></div><div class="task-body">';
+    h += '<ul class="checks" id="checks">' + l.task.checks.map((c, i) => '<li><span class="ck" id="ck' + i + '"></span><span>' + esc(c.label) + '</span></li>').join('') + '</ul>';
+    h += '<div class="fm-par"><b>Par ' + f.par + ' ticks</b> is what the reference solution takes. Finishing at or under par is optional.</div>';
+    h += '<div class="checks-note" id="checksNote">Checks run each time you press Run.</div>';
+    h += '<div id="hints">' + l.hints.slice(0, hintsShown).map((t, i) => '<div class="hint" style="margin-bottom:8px"><b>Hint ' + (i + 1) + '</b>' + t + '</div>').join('') + '</div>';
+    h += '<div class="task-actions" id="taskActions"><button class="btn primary" id="runFromTask">Run code</button>';
+    if (hintsShown < l.hints.length) h += '<button class="btn" id="hintBtn">' + (hintsShown ? 'Another hint' : 'Show a hint') + '</button>';
+    h += '<span id="solSlot"><button class="btn ghost" id="solBtn">Show solution</button></span></div></div><div id="completeSlot"></div></section>';
+    h += '<div class="prose">' + f.body + '</div>';
+    h += '<details class="fm-ref"><summary>Drone reference</summary><div class="prose">' + FARM.apiHtml() + '</div></details>';
+    h += '<details class="fm-ref"><summary>Run it in your own Rust project</summary><div class="prose">' +
+      '<p>Your code is ordinary Rust. When you press Run, the app adds the farm simulation (<code>mod farm</code>) and a <code>fn main()</code> after it and compiles the result. Copy that complete program to keep working on it with your own editor and Cargo:</p>' +
+      '<pre class="copyable"><code>cargo new drone_farm\ncd drone_farm\n# paste the program into src/main.rs, then:\ncargo run</code></pre>' +
+      '<p>It prints the same summary line you see here, plus one <code>@@</code> trace line per drone action, which is what this app reads to draw the replay. You can read and change the simulation too: it is at the bottom of the file.</p>' +
+      '<div class="task-actions"><button class="btn" id="copyProgram">Copy full program</button></div></div></details>';
+    h += pagerHtml();
+    h += '</div>';
+    if (farmPlayer) farmPlayer.unmount();
+    sheet.innerHTML = h;
+    decorateProse();
+    if (farmPlayer) farmPlayer.mount($('fm'));
+    const cp = $('copyProgram');
+    cp.onclick = () => {
+      const done = () => { cp.textContent = 'Copied'; setTimeout(() => { cp.textContent = 'Copy full program'; }, 1600); };
+      try { navigator.clipboard.writeText(fullProgram()).then(done, () => { cp.textContent = 'Copy failed'; }); } catch (e) { cp.textContent = 'Copy failed'; }
+    };
     bindSheet();
     renderTaskState(lastChecks, false);
   }
+  // Separate the farm's trace from what the program printed, so the output panel shows only the player's own output.
+  function prepareFarmResult(r) {
+    if (r.kind === 'compile') { r.farm = null; return; }
+    const out = r.output || [];
+    const stdout = out.filter((o) => o.t === 'out').map((o) => o.s).join('');
+    r.farm = FARM.parseTrace(stdout);
+    const visible = FARM.visibleOutput(stdout);
+    r.output = (visible ? [{ t: 'out', s: visible }] : []).concat(out.filter((o) => o.t !== 'out'));
+  }
+  function showFarmReplay(r) {
+    if (!farmPlayer) return;
+    const evs = r.farm ? r.farm.events : [];
+    const at = evs.length ? ' at tick ' + evs[evs.length - 1].tick : '';
+    const message = r.kind === 'compile' ? 'Compile error: the drone waits for code that builds'
+      : r.kind === 'panic' ? 'Your program panicked' + at
+      : r.kind === 'timeout' ? 'Stopped: the program ran too long'
+      : r.kind === 'internal' ? 'The teaching interpreter could not run this program'
+      : r.kind === 'limit' ? 'Stopped: too much output'
+      : r.kind === 'error-exit' ? 'The program exited with code ' + r.exitCode : null;
+    farmPlayer.load({ trace: r.kind === 'compile' ? null : r.farm, message });
+    if (window.matchMedia('(max-width: 760px)').matches) {
+      paneOut.insertAdjacentHTML('afterbegin', '<div class="console-actions"><button class="chip" id="watchReplay">Watch the drone</button></div>');
+      $('watchReplay').onclick = () => { setView('learn'); const fm = $('fm'); if (fm) fm.scrollIntoView({ block: 'start' }); };
+    } else {
+      const fm = $('fm');
+      const gap = fm ? fm.getBoundingClientRect().top - sheet.getBoundingClientRect().top : 0;
+      if (gap < 0) sheet.scrollTop = Math.max(0, sheet.scrollTop + gap - 12);
+    }
+  }
+  function farmCompleteHtml(justCompleted) {
+    const f = current.farm, rec = store.farm[current.id];
+    let msg = justCompleted ? 'Level complete.' : 'You completed this level.';
+    if (lastFarmRun) {
+      const t = lastFarmRun.ticks;
+      msg = (justCompleted ? 'Level complete' : 'Goal reached') + ' in ' + t + ' ticks. ' + (t < f.par ? 'Under par by ' + (f.par - t) + '!' : t === f.par ? 'Right on par.' : 'Par is ' + f.par + '.') + (lastFarmRun.newBest && !justCompleted ? ' New best.' : '');
+    } else if (rec) msg += ' Your best: ' + rec.best + ' ticks (par ' + f.par + ').';
+    return msg;
+  }
   function selectText(el) { const r = document.createRange(); r.selectNodeContents(el.querySelector('code') || el); const s = window.getSelection(); s.removeAllRanges(); s.addRange(r); }
   function pagerHtml() {
-    const idx = ALL.indexOf(current);
-    const prev = ALL[idx - 1], next = ALL[idx + 1];
+    const seq = current.farm ? FARM_LEVELS : COURSE;
+    const idx = seq.indexOf(current);
+    const prev = seq[idx - 1], next = seq[idx + 1];
     let h = '<nav class="pager" aria-label="Lesson navigation">';
     if (prev) h += '<a href="#' + prev.id + '"><small>Previous</small><span>' + (prev.num !== '∞' ? prev.num + ' ' : '') + esc(prev.title) + '</span></a>';
     if (next) h += '<a class="next" href="#' + next.id + '"><small>Next</small><span>' + (next.num !== '∞' ? next.num + ' ' : '') + esc(next.title) + '</span></a>';
@@ -480,8 +591,9 @@
     const slot = $('completeSlot');
     if (slot) {
       if (done) {
-        const idx = ALL.indexOf(current); const next = ALL[idx + 1];
-        slot.innerHTML = '<div class="complete"><p>' + (justCompleted ? 'Nice work. Lesson complete.' : 'You completed this lesson.') + '</p>' + (next ? '<a class="btn primary" href="#' + next.id + '">Next: ' + esc(next.title) + ' →</a>' : '') + '</div>';
+        const seq = current.farm ? FARM_LEVELS : COURSE;
+        const idx = seq.indexOf(current); const next = seq[idx + 1];
+        slot.innerHTML = '<div class="complete"><p>' + (current.farm ? esc(farmCompleteHtml(justCompleted)) : justCompleted ? 'Nice work. Lesson complete.' : 'You completed this lesson.') + '</p>' + (next ? '<a class="btn primary" href="#' + next.id + '">Next: ' + esc(next.title) + ' →</a>' : '') + '</div>';
       } else slot.innerHTML = '';
     }
   }
@@ -495,8 +607,11 @@
   function openLesson(id, force) {
     const l = byId[id] || byId.hello;
     if (current === l && !force) return;
-    current = l; lastChecks = null; lastResult = null;
-    store.last = l.id; save();
+    current = l; lastChecks = null; lastResult = null; lastFarmRun = null;
+    store.last = l.id; if (l.farm) store.lastFarm = l.id; save();
+    if (farmPlayer) { farmPlayer.unmount(); farmPlayer = null; }
+    if (l.farm) farmPlayer = new FARM.Player(l.farm);
+    updateFarmButton();
     ta.value = store.code[l.id] !== undefined ? store.code[l.id] : l.starter;
     $('dirtyDot').classList.toggle('dirty', ta.value !== l.starter);
     $('stdin').value = store.stdin[l.id] !== undefined ? store.stdin[l.id] : (l.stdin || '');
@@ -511,6 +626,12 @@
     setStatus('idle', 'ready', '');
     closeRail();
     if (document.title !== 'Oxide Workbench') document.title = 'Oxide Workbench';
+  }
+  function updateFarmButton() {
+    const b = $('farmBtn'); if (!b || !FARM_LEVELS.length) return;
+    const target = byId[store.lastFarm] ? store.lastFarm : (FARM_LEVELS.find((l) => !store.done[l.id]) || FARM_LEVELS[0]).id;
+    b.href = '#' + target;
+    if (current && current.farm) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
   }
   $('stdin').addEventListener('input', () => { if (current) { store.stdin[current.id] = $('stdin').value; save(); } });
   $('resetBtn').addEventListener('click', () => {
@@ -576,8 +697,9 @@
   }
   function contextText() {
     const l = current;
-    let ctx = 'Lesson: ' + (l.sandbox ? 'Sandbox (free practice)' : l.num + ' ' + l.title) + '\n';
-    if (!l.sandbox) ctx += 'Task: ' + l.task.steps.map((s) => s.replace(/<[^>]+>/g, '')).join(' ') + '\nChecks: ' + l.task.checks.map((c) => c.label).join('; ') + '\n';
+    let ctx = 'Lesson: ' + (l.sandbox ? 'Sandbox (free practice)' : l.farm ? 'Drone Farm level ' + l.num + ' ' + l.title : l.num + ' ' + l.title) + '\n';
+    if (l.farm) ctx += FARM.tutorContext(l.farm) + '\n';
+    else if (!l.sandbox) ctx += 'Task: ' + l.task.steps.map((s) => s.replace(/<[^>]+>/g, '')).join(' ') + '\nChecks: ' + l.task.checks.map((c) => c.label).join('; ') + '\n';
     ctx += '\nCurrent code (src/main.rs):\n```rust\n' + ta.value + '\n```\n';
     if (lastResult) {
       if (lastResult.kind === 'compile') ctx += '\nLast run: compile error\n' + lastResult.diag.lines.map((x) => x.s).join('\n') + '\n';
@@ -585,7 +707,7 @@
     } else ctx += '\nThe code has not been run yet.\n';
     return ctx;
   }
-  const RULES = 'You are the tutor inside Oxide Workbench, an interactive course that teaches Rust and how it is used to build fast, reliable software. Be warm, precise and brief: under 170 words unless the learner asks for more. Use Rust 2021. Prefer a guiding hint or question over a full solution, and only give complete solution code if the learner explicitly asks for it. Explain compiler errors in plain words: what rule was broken, why Rust has that rule, and what to change. Format with short paragraphs, `inline code` and ```rust fenced blocks. The learner\'s code runs in a browser teaching interpreter that supports a subset of std. If something might be unsupported there, suggest the Rust Playground button.';
+  const RULES = 'You are the tutor inside Oxide Workbench, an interactive course that teaches Rust and how it is used to build fast, reliable software. Be warm, precise and brief: under 170 words unless the learner asks for more. Use Rust 2021. Prefer a guiding hint or question over a full solution, and only give complete solution code if the learner explicitly asks for it. Explain compiler errors in plain words: what rule was broken, why Rust has that rule, and what to change. Format with short paragraphs, `inline code` and ```rust fenced blocks. The learner\'s code runs in a browser teaching interpreter that supports a subset of std. If something might be unsupported there, suggest the Rust Playground button. Drone Farm levels are a programming game: the learner writes fn run(d: &mut Drone) to steer a farm drone, every action costs ticks, and the goal is to meet the harvest target within the tick budget (and ideally at or under par). Help them reason about the algorithm and tick costs as well as the Rust.';
   async function askTutor(q) {
     if (!tutorReady || !q.trim()) return;
     if (!hasKey) { showTab('tutor'); renderTutorIntro(); return; }

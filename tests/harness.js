@@ -1,4 +1,4 @@
-// Runs every lesson's starter and solution, the sandbox, and tests/programs/*.rs through both rustc and the
+// Runs every lesson's starter and solution, the sandbox, tests/programs/*.rs and the Drone Farm levels through both rustc and the
 // teaching interpreter, and fails if their output or error codes disagree. Needs rustc on PATH.
 // Compare RustLite with rustc for a set of programs.
 const F = require('../ui/rustlite.js'); const RL = F();
@@ -72,6 +72,34 @@ if (require.main === module) {
   if (!only) for (const f of fs.readdirSync(path.join(__dirname, 'programs')).filter(f => f.endsWith('.rs')).sort()) {
     const src = fs.readFileSync(path.join(__dirname, 'programs', f), 'utf8'); const sin = fs.existsSync(path.join(__dirname, 'programs', f + '.in')) ? fs.readFileSync(path.join(__dirname, 'programs', f + '.in'), 'utf8') : '';
     if (compare('programs/' + f, src, sin).ok === false) fails++;
+  }
+  // Drone Farm: each level's starter and solution, run with the farm module appended
+  const FARM = require('../ui/farm.js');
+  for (const L of FARM.LEVELS) {
+    if (only && !L.id.includes(only)) continue;
+    for (const which of ['starter', 'solution']) {
+      const name = L.id + ':' + which;
+      const r = compare(name, FARM.program(L, L[which]));
+      if (r.ok === false) { fails++; continue; }
+      const t = FARM.parseTrace(r.b.stdout || '');
+      const bad = (why) => { fails++; console.log('   ' + name + ': ' + why); };
+      if (!t.end) { bad('no end line in the trace'); continue; }
+      // the board replay must end with the barn the Rust simulation reported
+      const s = FARM.initialState(L);
+      for (const ev of t.events) FARM.apply(s, ev);
+      const reported = Object.fromEntries([...(t.end.text || '').matchAll(/(\w+) (\d+)/g)].map((m) => [m[1], +m[2]]));
+      FARM.CROPS.forEach((c, i) => { if ((reported[c.name] || 0) !== s.barn[i]) bad('replay barn ' + c.name + ' ' + s.barn[i] + ' but the simulation reported ' + (reported[c.name] || 0)); });
+      if (s.tick !== t.end.tick && t.end.why !== 'time') bad('replay ended at tick ' + s.tick + ', simulation at ' + t.end.tick);
+      if (which === 'starter' && t.end.why === 'goal') bad('the starter already reaches the goal');
+      if (which === 'solution') {
+        if (t.end.why !== 'goal') bad('the solution does not reach the goal (' + t.end.why + ')');
+        else if (t.end.tick !== L.par) bad('the solution takes ' + t.end.tick + ' ticks but par is ' + L.par);
+        for (const c of L.checks) {
+          const pass = c.value.startsWith('re:') ? new RegExp(c.value.slice(3)).test(L.solution) : L.solution.includes(c.value);
+          if (c.type === 'code' && !pass) bad('check fails on the solution: ' + c.label);
+        }
+      }
+    }
   }
   console.log(fails ? fails + ' failures' : 'all good');
   process.exitCode = fails ? 1 : 0;

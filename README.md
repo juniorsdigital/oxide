@@ -6,6 +6,14 @@ Each lesson has an explanation, a "performance lens" note on why the feature mat
 
 Built with [Tauri 2](https://tauri.app), so the app itself is Rust.
 
+## Drone Farm
+
+**Drone Farm** is a programming game in the same window: you write Rust that steers a farm drone across a grid, and watch a replay of what it did. Seven levels go from a `for` loop over a 3 × 3 wheat field to breadth-first search around rocks and a full wheat → beet → melon economy where ripe melons rot. Each level has a goal within a tick budget, plus a par (the reference solution's tick count) to beat.
+
+You write `fn run(d: &mut Drone)` using a small API (`d.step(Dir::East)`, `d.till()`, `d.plant(Crop::Wheat)`, `d.harvest()`, `d.scan()`, ...). The farm simulation is itself Rust: when you press Run, the app appends it as `mod farm` plus a `fn main()` and runs the whole program in the same engine as the lessons. So the code is real, complete Rust: **Copy full program** puts it on the clipboard for `src/main.rs` in any Cargo project, and the Playground button opens it there too.
+
+The simulation prints one `@@` trace line per drone action; the app hides those from the output panel and replays them on the board.
+
 ## How code runs
 
 - **Real compiler.** If Rust is installed (`rustc` on your `PATH` or in `~/.cargo/bin`), each run compiles `src/main.rs` with your `rustc` in a temporary folder and runs the program as a native binary. Compile errors and warnings are exactly what `rustc` prints. Programs are stopped after 10 seconds and output is capped at 1 MB.
@@ -53,6 +61,7 @@ You can also open `ui/index.html` directly in a browser. That runs the lessons w
 
 ```
 ui/            the app's front end: index.html, styles.css, app.js, lessons.js (all lesson content)
+  farm.js      Drone Farm: the rules table, the levels, the Rust simulation it generates, and the replay board
   rustlite.js  generated bundle of the teaching interpreter (do not edit; run npm run build:engine)
   fonts/       Archivo, IBM Plex Sans, JetBrains Mono (SIL Open Font License, see fonts/OFL.txt)
 engine/        the teaching interpreter: lexer/parser, name resolution, runtime, diagnostics
@@ -72,6 +81,10 @@ The engine test fails if the interpreter's output differs from the real program'
 ### Adding a lesson
 
 Lessons are plain objects in `ui/lessons.js`: `body` and `perf` are HTML, `starter` and `solution` are Rust, and `task.checks` are evaluated after each run (`out`: stdout contains, `ok`: ran with exit code 0, `code` / `nocode`: source contains or not, with a `re:` prefix for a regex). Set `expectStarter` to the error code (or `panic`) the starter should produce, and the harness checks that against `rustc`.
+
+### Adding a Drone Farm level
+
+Levels are objects in `FARM.LEVELS` in `ui/farm.js`: `map` is one string per row (`.` wild ground, `_` tilled soil, `#` rock, `W`/`B`/`M` a ripe crop), with a tick `budget`, a `goal` such as `{ Melon: 30 }`, `par`, and `starter`, `solution`, `hints`, `checks` like a lesson. Crop timings, yields, seed costs and tick costs live in the `CROPS` and `COST` tables at the top of the file; the Rust simulation and the board replay are both generated from them. `npm run test:engine` runs every level in rustc and the interpreter and fails if the outputs differ, if the starter already wins, if the solution misses the goal or does not take exactly `par` ticks, or if the replay disagrees with the simulation about what ended up in the barn.
 
 ## Releases
 
